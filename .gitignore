@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# VS Code / IntelliJ
+.vscode/
+.idea/
+*.iml
+
+# Scala / sbt / Chisel
+target/
+project/target/
+project/project/
+.metals/
+.bloop/
+
+# Logs
+*.log
+
+# Temp / generated
+*.tmp
+*.out
+*.swp
