@@ -1,0 +1,1 @@
+resultReg := rs1Reg + rs2Reg
