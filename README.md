@@ -1,75 +1,133 @@
-# \# ELEN90093 CNN Convolution Accelerator
+# ELEN90093 CNN Convolution Accelerator
 
-# 
+## Team Members
 
-# \## Team Members
+- PAK YAT HUI
+- Teammate Name
 
-# \- PAK YAT HUI
+## Project Goal
 
-# \- Teammate Name
+This project implements a RISC-V RoCC-based CNN convolution accelerator for fixed-point matrix convolution.
 
-# 
+The current accelerator supports:
 
-# \## Project Goal
+- 32x32 input matrix
+- 32x32 output matrix
+- 1x1, 3x3, and 5x5 convolution kernels
+- 16-bit signed fixed-point 8.8 data
+- Zero padding
+- Runtime kernel size configuration
+- RoCC custom instruction interface
+- Success/error response through rd
 
-# Design and implement a RISC-V convolution accelerator for matrix convolution with fixed-point support.
+## Current Project Status
 
-# 
+The accelerator has been updated from the original control-path-only version to a configurable convolution accelerator.
 
-# \## Repository Structure
+The current version has been compiled successfully in Chipyard.
 
-# \- `src/`: Chisel source code
+Implemented features:
 
-# \- `tests/`: software and hardware tests
+- RoCC LazyRoCC accelerator structure
+- CONFIG / LOAD / COMPUTE / STORE command flow
+- Runtime kernel size selection
+- Support for 1x1, 3x3, and 5x5 kernels
+- Internal input buffer
+- Internal kernel buffer
+- Internal output buffer
+- Real memory load through io.mem.req and io.mem.resp
+- Real memory store through io.mem.req
+- 25-MAC datapath for maximum 5x5 convolution
+- Runtime masking for smaller kernels
+- Zero padding for boundary elements
+- Basic command sequence checking
+- Binary success/error return value
 
-# \- `docs/`: design notes, FSM, meeting notes
+## Main Accelerator File
 
-# \- `reports/`: report materials and figures
+GitHub project file:
 
-# \- `scripts/`: helper scripts
+```text
+src/main/chisel/ConvAccelerator.scala
+```
 
-# 
+Chipyard compile location:
 
-# \## Workflow
+```text
+~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
+```
 
-# \- `main` branch must stay stable
+Important:
 
-# \- all development happens in feature branches
+The GitHub project file is used for version control.
 
-# \- merge to `main` through pull requests only
+The Chipyard file is the one actually compiled by Chipyard.
 
-## Current Progress From PAK (Control Path Implemented)
+When testing the accelerator in Chipyard, copy the GitHub file into the Chipyard compile location.
 
-### Accelerator FSM
-We have implemented the initial control FSM for the convolution accelerator based on a RoCC interface.
+## Custom Instruction Interface
 
-FSM states:
-- Idle
-- Decode
-- Load
-- Compute
-- Store
-- Respond
+The accelerator uses the funct7 field to select commands.
 
-### Instruction Design
-The accelerator currently uses the funct field to distinguish commands:
-- funct = 0 → LOAD
-- funct = 1 → COMPUTE
-- funct = 2 → STORE
+```text
+funct7 = 0
+Command = CONFIG
+rs1 = kernel size
+rs2 = output address
+rd = 1 for success, 0 for error
 
-### Implementation Details
-- Based on Workshop 4 MyMAC structure (LazyRoCC)
-- Command buffering via Queue(io.cmd, 1)
-- FSM implemented in MyConvAccelModule
-- Control signals:
-  - mem_read_en (placeholder)
-  - compute_en (placeholder)
-  - mem_write_en (placeholder)
-- Multi-cycle operations are currently simulated using counters
+funct7 = 1
+Command = LOAD
+rs1 = input address
+rs2 = kernel address
+rd = 1 for success, 0 for error
 
-### TODO (Next Steps)
-- Implement real memory interface (io.mem.req / resp)
-- Integrate convolution datapath (MAC / sliding window)
-- Support multiple sub-commands for load/config
-- Add proper handshake (load_done / compute_done / store_done)
-- Performance evaluation and benchmarking
+funct7 = 2
+Command = COMPUTE
+rs1 = unused
+rs2 = unused
+rd = 1 for success, 0 for error
+
+funct7 = 3
+Command = STORE
+rs1 = unused
+rs2 = unused
+rd = 1 for success, 0 for error
+```
+
+Required command order:
+
+```c
+conv_config(kernel_size, output_addr);
+conv_load(input_addr, kernel_addr);
+conv_compute();
+conv_store();
+```
+
+## Repository Structure
+
+```text
+src/      Chisel and Scala source code for the accelerator.
+tests/    Software and hardware tests.
+docs/     Project notes, setup instructions, and accelerator documentation.
+reports/  Report materials and figures.
+scripts/  Helper scripts.
+```
+
+## Current Branch
+
+```text
+feature/accelerator-fsm
+```
+
+## Next Steps
+
+- Write C test program using RoCC macros
+- Test 1x1, 3x3, and 5x5 convolution
+- Compare accelerator output with CPU reference output
+- Measure cycle count using rdcycle
+- Compare software-only convolution against accelerator convolution
+- Prepare FSM diagram
+- Prepare datapath diagram
+- Prepare memory flow diagram
+- Update report and presentation materials
