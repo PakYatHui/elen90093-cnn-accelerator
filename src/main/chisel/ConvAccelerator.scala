@@ -104,7 +104,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.addr := 0.U
   io.mem.req.bits.tag := 0.U
   io.mem.req.bits.cmd := M_XRD
-  io.mem.req.bits.typ := MT_H
+  io.mem.req.bits.size := 1.U
   io.mem.req.bits.phys := false.B
   io.mem.req.bits.signed := true.B
   io.mem.req.bits.data := 0.U
@@ -153,7 +153,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val macSum = macTerms.reduce(_ + _)
 
   // Keep the original truncation behaviour and store the lower 16 bits.
-  val macOut16 = macSum.asUInt()(15, 0).asSInt
+  val macOut16 = (macSum.asUInt)(15, 0).asSInt
   val outIndex = (outRow << 5) + outCol
 
   switch(state) {
@@ -262,7 +262,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           io.mem.req.bits.addr := inputAddrReg + (inputLoadIdx << 1)
           io.mem.req.bits.tag := 0.U
           io.mem.req.bits.cmd := M_XRD
-          io.mem.req.bits.typ := MT_H
+          io.mem.req.bits.size := 1.U
           io.mem.req.bits.signed := true.B
 
           when(io.mem.req.fire) {
@@ -276,7 +276,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           io.mem.req.bits.addr := kernelAddrReg + (kernelLoadIdx << 1)
           io.mem.req.bits.tag := 1.U
           io.mem.req.bits.cmd := M_XRD
-          io.mem.req.bits.typ := MT_H
+          io.mem.req.bits.size := 1.U
           io.mem.req.bits.signed := true.B
 
           when(io.mem.req.fire) {
@@ -336,7 +336,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
         io.mem.req.bits.tag := 2.U
         io.mem.req.bits.cmd := M_XWR
-        io.mem.req.bits.typ := MT_H
+        io.mem.req.bits.size := 1.U
         io.mem.req.bits.signed := true.B
         io.mem.req.bits.data := outputBuf(storeIdx).pad(xLen).asUInt
 
