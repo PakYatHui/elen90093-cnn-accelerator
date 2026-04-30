@@ -17,73 +17,89 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   extends LazyRoCCModuleImp(outer)
   with HasCoreParameters {
 
-  // English comment: Buffer incoming commands
+  // Buffer incoming commands from the RoCC interface.
   val cmd = Queue(io.cmd, 1)
 
-  // English comment: Fixed design parameters
-  val INPUT_SIZE  = 32
-  val KERNEL_SIZE = 3
-  val INPUT_ELEMS = INPUT_SIZE * INPUT_SIZE
-  val KERNEL_ELEMS = KERNEL_SIZE * KERNEL_SIZE
+  // Fixed design parameters.
+  val INPUT_SIZE       = 32
+  val INPUT_ELEMS      = INPUT_SIZE * INPUT_SIZE
+  val MAX_KERNEL_SIZE  = 5
+  val MAX_KERNEL_ELEMS = MAX_KERNEL_SIZE * MAX_KERNEL_SIZE
 
-  // English comment: funct7 encoding
-  val FUNCT_LOAD    = 0.U(7.W)
-  val FUNCT_COMPUTE = 1.U(7.W)
-  val FUNCT_STORE   = 2.U(7.W)
+  // Return values.
+  val RET_ERROR   = 0.U(xLen.W)
+  val RET_SUCCESS = 1.U(xLen.W)
 
-  // English comment: FSM states
-  val sIdle :: sDecode :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(6)
+  // funct7 encoding.
+  val FUNCT_CONFIG  = 0.U(7.W)
+  val FUNCT_LOAD    = 1.U(7.W)
+  val FUNCT_COMPUTE = 2.U(7.W)
+  val FUNCT_STORE   = 3.U(7.W)
+
+  // FSM states.
+  val sIdle :: sDecode :: sConfig :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(7)
   val state = RegInit(sIdle)
 
-  // English comment: Latched command fields
+  // Latched command fields.
   val functReg = RegInit(0.U(7.W))
   val rs1Reg   = RegInit(0.U(xLen.W))
   val rs2Reg   = RegInit(0.U(xLen.W))
   val rdReg    = RegInit(0.U(5.W))
+  val dprvReg  = RegInit(0.U(2.W))
 
-  // English comment: Address registers
-  val inputAddrReg  = RegInit(0.U(xLen.W))
-  val kernelAddrReg = RegInit(0.U(xLen.W))
-  val outputAddrReg = RegInit(0.U(xLen.W))
+  // Runtime configuration registers.
+  val inputAddrReg   = RegInit(0.U(xLen.W))
+  val kernelAddrReg  = RegInit(0.U(xLen.W))
+  val outputAddrReg  = RegInit(0.U(xLen.W))
+  val kernelSizeReg  = RegInit(0.U(3.W))
+  val kernelElemsReg = RegInit(0.U(6.W))
 
-  // English comment: Status/result registers
-  val resultReg     = RegInit(0.U(xLen.W))
-  val illegalCmdReg = RegInit(false.B)
+  // Command-sequence protection flags.
+  val configuredReg = RegInit(false.B)
+  val loadedReg     = RegInit(false.B)
+  val computedReg   = RegInit(false.B)
 
-  // English comment: Internal accelerator buffers
+  // Response register. The design only exposes success or error.
+  val resultReg = RegInit(RET_ERROR)
+
+  // Internal accelerator buffers.
   val inputBuf  = Reg(Vec(INPUT_ELEMS, SInt(16.W)))
-  val kernelBuf = Reg(Vec(KERNEL_ELEMS, SInt(16.W)))
+  val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, SInt(16.W)))
   val outputBuf = Reg(Vec(INPUT_ELEMS, SInt(16.W)))
 
-  // English comment: Load/store bookkeeping
-  val inputLoadIdx   = RegInit(0.U(10.W))
-  val kernelLoadIdx  = RegInit(0.U(4.W))
-  val storeIdx       = RegInit(0.U(10.W))
-  val memInflight    = RegInit(false.B)
-  val issuedIsInput  = RegInit(false.B)
-  val issuedIndex    = RegInit(0.U(10.W))
+  // Load/store bookkeeping. These counters must hold the terminal value 1024.
+  val inputLoadIdx  = RegInit(0.U(11.W))
+  val kernelLoadIdx = RegInit(0.U(6.W))
+  val storeIdx      = RegInit(0.U(11.W))
+  val memInflight   = RegInit(false.B)
+  val issuedIsInput = RegInit(false.B)
+  val issuedIndex   = RegInit(0.U(11.W))
 
-  // English comment: Compute bookkeeping
+  // Compute bookkeeping.
   val outRow = RegInit(0.U(6.W))
   val outCol = RegInit(0.U(6.W))
 
-  // English comment: Helper wires
+  // Helper wires.
+  val doConfig  = functReg === FUNCT_CONFIG
   val doLoad    = functReg === FUNCT_LOAD
   val doCompute = functReg === FUNCT_COMPUTE
   val doStore   = functReg === FUNCT_STORE
 
-  // English comment: Default command handshake
+  val validKernelSize =
+    (rs1Reg === 1.U) || (rs1Reg === 3.U) || (rs1Reg === 5.U)
+
+  // Default command handshake.
   cmd.ready := false.B
 
-  // English comment: Default response interface
+  // Default response interface.
   io.resp.valid := false.B
   io.resp.bits.rd := rdReg
   io.resp.bits.data := resultReg
 
-  io.busy := (state =/= sIdle)
+  io.busy := state =/= sIdle
   io.interrupt := false.B
 
-  // English comment: Default memory request interface
+  // Default memory request interface.
   io.mem.req.valid := false.B
   io.mem.req.bits.addr := 0.U
   io.mem.req.bits.tag := 0.U
@@ -92,111 +108,154 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.phys := false.B
   io.mem.req.bits.signed := true.B
   io.mem.req.bits.data := 0.U
-  io.mem.req.bits.dprv := cmd.bits.status.dprv
+  io.mem.req.bits.dprv := dprvReg
 
-  // English comment: Debug print for accepted command
   when(cmd.fire) {
     printf("[MyConvAccel] CMD fire funct=%d rs1=%x rs2=%x rd=%d state=%d\n",
       cmd.bits.inst.funct, cmd.bits.rs1, cmd.bits.rs2, cmd.bits.inst.rd, state)
   }
 
-  // English comment: Helper function for padded 3x3 access
+  // Return the input element selected by a variable-size centred kernel window.
+  // Out-of-range accesses implement zero padding.
   def getInputAt(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): SInt = {
-    val rowValid = kr match {
-      case 0 => baseRow =/= 0.U
-      case 1 => true.B
-      case 2 => baseRow =/= (INPUT_SIZE - 1).U
-    }
+    val radius = kernelSizeReg >> 1
 
-    val colValid = kc match {
-      case 0 => baseCol =/= 0.U
-      case 1 => true.B
-      case 2 => baseCol =/= (INPUT_SIZE - 1).U
-    }
+    val rowS = baseRow.zext + kr.S(4.W) - radius.zext
+    val colS = baseCol.zext + kc.S(4.W) - radius.zext
 
-    val rowIdx = Wire(UInt(6.W))
-    val colIdx = Wire(UInt(6.W))
+    val rowValid = rowS >= 0.S && rowS < INPUT_SIZE.S
+    val colValid = colS >= 0.S && colS < INPUT_SIZE.S
 
-    rowIdx := baseRow
-    colIdx := baseCol
+    val rowIdx = rowS.asUInt
+    val colIdx = colS.asUInt
+    val inputIndex = (rowIdx << 5) + colIdx
 
-    if (kr == 0) rowIdx := baseRow - 1.U
-    if (kr == 2) rowIdx := baseRow + 1.U
-
-    if (kc == 0) colIdx := baseCol - 1.U
-    if (kc == 2) colIdx := baseCol + 1.U
-
-    Mux(rowValid && colValid, inputBuf(rowIdx * INPUT_SIZE.U + colIdx), 0.S(16.W))
+    Mux(rowValid && colValid, inputBuf(inputIndex), 0.S(16.W))
   }
 
-  // English comment: Combinational MAC tree for one output element
-  val macTerms = Wire(Vec(KERNEL_ELEMS, SInt(32.W)))
-  for (kr <- 0 until KERNEL_SIZE) {
-    for (kc <- 0 until KERNEL_SIZE) {
+  // Parallel MAC tree for one output element. The hardware contains the maximum
+  // 5x5 datapath, while runtime masks select 1x1, 3x3, or 5x5 operation.
+  val macTerms = Wire(Vec(MAX_KERNEL_ELEMS, SInt(32.W)))
+
+  for (kr <- 0 until MAX_KERNEL_SIZE) {
+    for (kc <- 0 until MAX_KERNEL_SIZE) {
+      val termIdx = kr * MAX_KERNEL_SIZE + kc
+      val active = kr.U < kernelSizeReg && kc.U < kernelSizeReg
+      val kernelIndex = kr.U(3.W) * kernelSizeReg + kc.U(3.W)
       val inVal = getInputAt(outRow, outCol, kr, kc)
-      val kerVal = kernelBuf(kr * KERNEL_SIZE + kc)
-      // English comment: 8.8 x 8.8 -> 16.16, then shift back to 8.8
-      macTerms(kr * KERNEL_SIZE + kc) := (inVal * kerVal) >> 8
+      val kerVal = kernelBuf(kernelIndex)
+
+      // 8.8 x 8.8 produces 16.16. Shift right by 8 to return to 8.8 scale.
+      macTerms(termIdx) := Mux(active, (inVal * kerVal) >> 8, 0.S(32.W))
     }
   }
+
   val macSum = macTerms.reduce(_ + _)
+
+  // Keep the original truncation behaviour and store the lower 16 bits.
   val macOut16 = macSum.asUInt()(15, 0).asSInt
+  val outIndex = (outRow << 5) + outCol
 
   switch(state) {
 
     is(sIdle) {
-      illegalCmdReg := false.B
       cmd.ready := true.B
 
       when(cmd.fire) {
-        // English comment: Latch command fields
         functReg := cmd.bits.inst.funct
         rs1Reg   := cmd.bits.rs1
         rs2Reg   := cmd.bits.rs2
         rdReg    := cmd.bits.inst.rd
+        dprvReg  := cmd.bits.status.dprv
         state    := sDecode
       }
     }
 
     is(sDecode) {
-      when(doLoad) {
-        // English comment: LOAD uses rs1=input address and rs2=kernel address
-        inputAddrReg := rs1Reg
-        kernelAddrReg := rs2Reg
+      when(doConfig) {
+        state := sConfig
 
-        inputLoadIdx  := 0.U
-        kernelLoadIdx := 0.U
-        memInflight   := false.B
-
-        printf("[MyConvAccel] sDecode -> sLoad inputAddr=%x kernelAddr=%x\n", rs1Reg, rs2Reg)
-        state := sLoad
+      }.elsewhen(doLoad) {
+        when(configuredReg) {
+          inputAddrReg  := rs1Reg
+          kernelAddrReg := rs2Reg
+          inputLoadIdx  := 0.U
+          kernelLoadIdx := 0.U
+          memInflight   := false.B
+          printf("[MyConvAccel] Decode -> Load inputAddr=%x kernelAddr=%x kernelSize=%d\n",
+            rs1Reg, rs2Reg, kernelSizeReg)
+          state := sLoad
+        }.otherwise {
+          resultReg := RET_ERROR
+          printf("[MyConvAccel] LOAD rejected: accelerator is not configured\n")
+          state := sRespond
+        }
 
       }.elsewhen(doCompute) {
-        // English comment: COMPUTE uses previously loaded buffers
-        outRow := 0.U
-        outCol := 0.U
-
-        printf("[MyConvAccel] sDecode -> sCompute\n")
-        state := sCompute
+        when(configuredReg && loadedReg) {
+          outRow := 0.U
+          outCol := 0.U
+          printf("[MyConvAccel] Decode -> Compute kernelSize=%d\n", kernelSizeReg)
+          state := sCompute
+        }.otherwise {
+          resultReg := RET_ERROR
+          printf("[MyConvAccel] COMPUTE rejected: missing CONFIG or LOAD\n")
+          state := sRespond
+        }
 
       }.elsewhen(doStore) {
-        // English comment: STORE uses rs1=output address
-        outputAddrReg := rs1Reg
-        storeIdx := 0.U
-
-        printf("[MyConvAccel] sDecode -> sStore outputAddr=%x\n", rs1Reg)
-        state := sStore
+        when(configuredReg && loadedReg && computedReg) {
+          storeIdx := 0.U
+          printf("[MyConvAccel] Decode -> Store outputAddr=%x\n", outputAddrReg)
+          state := sStore
+        }.otherwise {
+          resultReg := RET_ERROR
+          printf("[MyConvAccel] STORE rejected: missing CONFIG, LOAD, or COMPUTE\n")
+          state := sRespond
+        }
 
       }.otherwise {
-        illegalCmdReg := true.B
-        resultReg := "hdead".U
+        resultReg := RET_ERROR
         printf("[MyConvAccel] Illegal funct=%d\n", functReg)
         state := sRespond
       }
     }
 
+    is(sConfig) {
+      when(validKernelSize) {
+        kernelSizeReg := rs1Reg(2, 0)
+        outputAddrReg := rs2Reg
+
+        when(rs1Reg === 1.U) {
+          kernelElemsReg := 1.U
+        }.elsewhen(rs1Reg === 3.U) {
+          kernelElemsReg := 9.U
+        }.otherwise {
+          kernelElemsReg := 25.U
+        }
+
+        configuredReg := true.B
+        loadedReg := false.B
+        computedReg := false.B
+        resultReg := RET_SUCCESS
+
+        printf("[MyConvAccel] CONFIG success kernelSize=%d outputAddr=%x\n", rs1Reg, rs2Reg)
+      }.otherwise {
+        configuredReg := false.B
+        loadedReg := false.B
+        computedReg := false.B
+        kernelSizeReg := 0.U
+        kernelElemsReg := 0.U
+        resultReg := RET_ERROR
+
+        printf("[MyConvAccel] CONFIG error invalid kernelSize=%d\n", rs1Reg)
+      }
+
+      state := sRespond
+    }
+
     is(sLoad) {
-      // English comment: Issue one read at a time for input matrix then kernel
+      // Issue one read at a time: first the 32x32 input, then the active kernel.
       when(!memInflight) {
         when(inputLoadIdx < INPUT_ELEMS.U) {
           io.mem.req.valid := true.B
@@ -210,10 +269,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             memInflight := true.B
             issuedIsInput := true.B
             issuedIndex := inputLoadIdx
-            printf("[MyConvAccel] LOAD input idx=%d addr=%x\n", inputLoadIdx, inputAddrReg + (inputLoadIdx << 1))
           }
 
-        }.elsewhen(kernelLoadIdx < KERNEL_ELEMS.U) {
+        }.elsewhen(kernelLoadIdx < kernelElemsReg) {
           io.mem.req.valid := true.B
           io.mem.req.bits.addr := kernelAddrReg + (kernelLoadIdx << 1)
           io.mem.req.bits.tag := 1.U
@@ -225,12 +283,13 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             memInflight := true.B
             issuedIsInput := false.B
             issuedIndex := kernelLoadIdx
-            printf("[MyConvAccel] LOAD kernel idx=%d addr=%x\n", kernelLoadIdx, kernelAddrReg + (kernelLoadIdx << 1))
           }
 
         }.otherwise {
-          resultReg := 1.U
-          printf("[MyConvAccel] sLoad -> sRespond done\n")
+          loadedReg := true.B
+          computedReg := false.B
+          resultReg := RET_SUCCESS
+          printf("[MyConvAccel] LOAD complete\n")
           state := sRespond
         }
       }
@@ -241,11 +300,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         when(issuedIsInput) {
           inputBuf(issuedIndex) := loadedData
           inputLoadIdx := inputLoadIdx + 1.U
-          printf("[MyConvAccel] LOAD RESP input idx=%d data=%x\n", issuedIndex, io.mem.resp.bits.data(15, 0))
         }.otherwise {
-          kernelBuf(issuedIndex(3, 0)) := loadedData
+          kernelBuf(issuedIndex(4, 0)) := loadedData
           kernelLoadIdx := kernelLoadIdx + 1.U
-          printf("[MyConvAccel] LOAD RESP kernel idx=%d data=%x\n", issuedIndex, io.mem.resp.bits.data(15, 0))
         }
 
         memInflight := false.B
@@ -253,18 +310,16 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sCompute) {
-      // English comment: Compute one output element per cycle
-      outputBuf(outRow * INPUT_SIZE.U + outCol) := macOut16
-
-      printf("[MyConvAccel] COMPUTE row=%d col=%d out=%x\n",
-        outRow, outCol, macOut16.asUInt)
+      // Compute one output element per cycle.
+      outputBuf(outIndex) := macOut16
 
       when(outCol === (INPUT_SIZE - 1).U) {
         outCol := 0.U
         when(outRow === (INPUT_SIZE - 1).U) {
           outRow := 0.U
-          resultReg := 1.U
-          printf("[MyConvAccel] sCompute -> sRespond done\n")
+          computedReg := true.B
+          resultReg := RET_SUCCESS
+          printf("[MyConvAccel] COMPUTE complete\n")
           state := sRespond
         }.otherwise {
           outRow := outRow + 1.U
@@ -275,7 +330,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sStore) {
-      // English comment: Issue one store per cycle
+      // Write the 32x32 output matrix back to memory.
       when(storeIdx < INPUT_ELEMS.U) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
@@ -286,13 +341,11 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         io.mem.req.bits.data := outputBuf(storeIdx).pad(xLen).asUInt
 
         when(io.mem.req.fire) {
-          printf("[MyConvAccel] STORE idx=%d addr=%x data=%x\n",
-            storeIdx, outputAddrReg + (storeIdx << 1), outputBuf(storeIdx).asUInt)
           storeIdx := storeIdx + 1.U
         }
       }.otherwise {
-        resultReg := 1.U
-        printf("[MyConvAccel] sStore -> sRespond done\n")
+        resultReg := RET_SUCCESS
+        printf("[MyConvAccel] STORE complete\n")
         state := sRespond
       }
     }
@@ -301,8 +354,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       io.resp.valid := true.B
 
       when(io.resp.fire) {
-        printf("[MyConvAccel] RESP fire rd=%d data=%x illegal=%d\n",
-          rdReg, resultReg, illegalCmdReg)
+        printf("[MyConvAccel] RESP fire rd=%d data=%x\n", rdReg, resultReg)
         state := sIdle
       }
     }
