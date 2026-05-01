@@ -19,4 +19,7 @@ project/project/
 # Temp / generated
 *.tmp
 *.out
-*.swp
+*.swp*.Zone.Identifier
+*.o
+*.riscv
+tests/hardware/.metals-scala-cli/
