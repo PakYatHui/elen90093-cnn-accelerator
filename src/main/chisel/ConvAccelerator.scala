@@ -117,6 +117,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   // Return the input element selected by a variable-size centred kernel window.
   // Out-of-range accesses implement zero padding.
+  //查找所求输出（i,j）位置偏移（kr-1，kc-1)的原矩阵数值，超界则返回0
   def getInputAt(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): SInt = {
     val radius = kernelSizeReg >> 1
 
@@ -130,20 +131,25 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     val colIdx = colS.asUInt
     val inputIndex = (rowIdx << 5) + colIdx
 
-    Mux(rowValid && colValid, inputBuf(inputIndex), 0.S(16.W))
+    Mux(rowValid && colValid, inputBuf(inputIndex), 0.S(16.W))//二选一 return
   }
 
   // Parallel MAC tree for one output element. The hardware contains the maximum
   // 5x5 datapath, while runtime masks select 1x1, 3x3, or 5x5 operation.
+
   val macTerms = Wire(Vec(MAX_KERNEL_ELEMS, SInt(32.W)))
 
   for (kr <- 0 until MAX_KERNEL_SIZE) {
     for (kc <- 0 until MAX_KERNEL_SIZE) {
       val termIdx = kr * MAX_KERNEL_SIZE + kc
       val active = kr.U < kernelSizeReg && kc.U < kernelSizeReg
+
+      //计算KernelIndex（二维转化一维存储）
       val kernelIndex = kr.U(3.W) * kernelSizeReg + kc.U(3.W)
-      val inVal = getInputAt(outRow, outCol, kr, kc)
-      val kerVal = kernelBuf(kernelIndex)
+
+      //用到上面函数，拿到原矩阵对应位置数值（含zero padding）
+      val inVal = getInputAt(outRow, outCol, kr, kc)//input阵时二维存储的
+      val kerVal = kernelBuf(kernelIndex)//kernel是一维存储的
 
       // 8.8 x 8.8 produces 16.16. Shift right by 8 to return to 8.8 scale.
       macTerms(termIdx) := Mux(active, (inVal * kerVal) >> 8, 0.S(32.W))
@@ -295,8 +301,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       }
 
       when(io.mem.resp.valid) {
-        val loadedData = io.mem.resp.bits.data(15, 0).asSInt
 
+        val loadedData = io.mem.resp.bits.data(15, 0).asSInt
+      //  val laneShift = issuedIndex(1, 0)
+      //   val loadedData = (io.mem.resp.bits.data >> (laneShift << 4))(15, 0).asSInt
         when(issuedIsInput) {
           inputBuf(issuedIndex) := loadedData
           inputLoadIdx := inputLoadIdx + 1.U
@@ -329,6 +337,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       }
     }
 
+
+
     is(sStore) {
       // Write the 32x32 output matrix back to memory.
       when(storeIdx < INPUT_ELEMS.U) {
@@ -338,7 +348,14 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         io.mem.req.bits.cmd := M_XWR
         io.mem.req.bits.size := 1.U
         io.mem.req.bits.signed := true.B
-        io.mem.req.bits.data := outputBuf(storeIdx).pad(xLen).asUInt
+
+        //每4个数据共享一个内存总线（8Bytes，data=2Bytes）。 
+//         storeIdx(1,0) = 0 → 数据放 bits[15:0]   → 左移 0  位
+// storeIdx(1,0) = 1 → 数据放 bits[31:16]  → 左移 16 位
+// storeIdx(1,0) = 2 → 数据放 bits[47:32]  → 左移 32 位
+// storeIdx(1,0) = 3 → 数据放 bits[63:48]  → 左移 48 位
+        //io.mem.req.bits.data := outputBuf(storeIdx).pad(xLen).asUInt
+        io.mem.req.bits.data := outputBuf(storeIdx).pad(xLen).asUInt << (storeIdx(1, 0) << 4)
 
         when(io.mem.req.fire) {
           storeIdx := storeIdx + 1.U

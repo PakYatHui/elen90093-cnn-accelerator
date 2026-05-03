@@ -142,10 +142,16 @@ static inline uint64_t read_cycle(void) {
     asm volatile ("rdcycle %0" : "=r"(cycle));
     return cycle;
 }
+
+
+
+
+
+
+
 // =============================================================================
 // Run one complete test: fill buffers, run HW + SW, compare
 // =============================================================================
-
 //生成原始矩阵（aij=i+j)和kernel（kij只在中心为1，即图像不变）
 static int run_test(const char *name, int kernel_size) {
     memset(hw_output, 0, sizeof(hw_output));
@@ -157,15 +163,17 @@ static int run_test(const char *name, int kernel_size) {
         for (int col = 0; col < INPUT_SIZE; col++)
             input_buf[row * INPUT_SIZE + col] = TO_FP(row + col);
 
-    // --- Fill kernel: identity-like, centre = 1.0, rest = 0 (for 1x1 always 1) ---
-   // int k_elems = kernel_size * kernel_size;
+   //生成全1kernel
+    int k_elems = kernel_size * kernel_size;
     memset(kernel_buf, 0, sizeof(kernel_buf));
     if (kernel_size == 1) {
         kernel_buf[0] = TO_FP(1.0);
     } else {
-        // Centre element = 1.0, others stay 0 (acts as identity convolution)
-        int centre = (kernel_size / 2) * kernel_size + (kernel_size / 2);
-        kernel_buf[centre] = TO_FP(1.0);
+       //生成全1kernel
+       for(int i=0;i<k_elems;i++){
+        kernel_buf[i]=TO_FP(1.0);
+       }
+       
     }
 
 
@@ -265,7 +273,7 @@ static int check_output(const char *test_name) {
     // 打印前9个元素对比
     printf("[%s] First 8 outputs:\n", test_name);
     printf("  idx | sw_output        | hw_output\n");
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 64; i++) {
         printf("  [%d] | 0x%04x (%.4f) | 0x%04x (%.4f)\n",
                i,
                (uint16_t)sw_output[i], FROM_FP(sw_output[i]),
