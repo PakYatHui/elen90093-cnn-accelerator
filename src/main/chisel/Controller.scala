@@ -1,4 +1,3 @@
-//package tutorial
 package myaccelerators
 
 import chisel3._
