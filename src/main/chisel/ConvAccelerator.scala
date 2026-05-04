@@ -46,6 +46,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val rs2Reg   = RegInit(0.U(xLen.W))
   val rdReg    = RegInit(0.U(5.W))
   val dprvReg  = RegInit(0.U(2.W))
+  val xdReg    = RegInit(false.B)
 
   // Runtime configuration registers.
   val inputAddrReg   = RegInit(0.U(xLen.W))
@@ -67,7 +68,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, SInt(16.W)))
   val outputBuf = Reg(Vec(INPUT_ELEMS, SInt(16.W)))
 
-  // Load/store bookkeeping. These counters must hold the terminal value 1024.
+  // Load/store bookkeeping.
   val inputLoadIdx  = RegInit(0.U(11.W))
   val kernelLoadIdx = RegInit(0.U(6.W))
   val storeIdx      = RegInit(0.U(11.W))
@@ -111,8 +112,14 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.dprv := dprvReg
 
   when(cmd.fire) {
-    printf("[MyConvAccel] CMD fire funct=%d rs1=%x rs2=%x rd=%d state=%d\n",
-      cmd.bits.inst.funct, cmd.bits.rs1, cmd.bits.rs2, cmd.bits.inst.rd, state)
+    printf("[MyConvAccel] CMD fire funct=%d rs1=%x rs2=%x rd=%d xd=%d state=%d\n",
+      cmd.bits.inst.funct,
+      cmd.bits.rs1,
+      cmd.bits.rs2,
+      cmd.bits.inst.rd,
+      cmd.bits.inst.xd,
+      state
+    )
   }
 
   // Return the input element selected by a variable-size centred kernel window.
@@ -133,8 +140,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)), 0.S(16.W))
   }
 
-  // Parallel MAC tree for one output element. The hardware contains the maximum
-  // 5x5 datapath, while runtime masks select 1x1, 3x3, or 5x5 operation.
+  // Parallel MAC tree for one output element.
   val macTerms = Wire(Vec(MAX_KERNEL_ELEMS, SInt(32.W)))
 
   for (kr <- 0 until MAX_KERNEL_SIZE) {
@@ -167,6 +173,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         rs2Reg   := cmd.bits.rs2
         rdReg    := cmd.bits.inst.rd
         dprvReg  := cmd.bits.status.dprv
+        xdReg    := cmd.bits.inst.xd
         state    := sDecode
       }
     }
@@ -182,8 +189,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           inputLoadIdx  := 0.U
           kernelLoadIdx := 0.U
           memInflight   := false.B
+
           printf("[MyConvAccel] Decode -> Load inputAddr=%x kernelAddr=%x kernelSize=%d\n",
             rs1Reg, rs2Reg, kernelSizeReg)
+
           state := sLoad
         }.otherwise {
           resultReg := RET_ERROR
@@ -195,7 +204,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         when(configuredReg && loadedReg) {
           outRow := 0.U
           outCol := 0.U
+
           printf("[MyConvAccel] Decode -> Compute kernelSize=%d\n", kernelSizeReg)
+
           state := sCompute
         }.otherwise {
           resultReg := RET_ERROR
@@ -206,7 +217,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       }.elsewhen(doStore) {
         when(configuredReg && loadedReg && computedReg) {
           storeIdx := 0.U
+          memInflight := false.B
+
           printf("[MyConvAccel] Decode -> Store outputAddr=%x\n", outputAddrReg)
+
           state := sStore
         }.otherwise {
           resultReg := RET_ERROR
@@ -289,7 +303,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           loadedReg := true.B
           computedReg := false.B
           resultReg := RET_SUCCESS
+
           printf("[MyConvAccel] LOAD complete\n")
+
           state := sRespond
         }
       }
@@ -313,9 +329,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       // Compute one output element per cycle.
       outputBuf(outIndex(9, 0)) := macOut16
 
-      // Debug selected output indices before STORE.
       val watchComputeIdx =
         (outIndex < 4.U) ||
+        (outIndex === 416.U) ||
         (outIndex === 704.U) ||
         (outIndex === 832.U) ||
         (outIndex >= 1020.U)
@@ -329,15 +345,17 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           macOut16.asUInt
         )
       }
-      // Debug end
 
       when(outCol === (INPUT_SIZE - 1).U) {
         outCol := 0.U
+
         when(outRow === (INPUT_SIZE - 1).U) {
           outRow := 0.U
           computedReg := true.B
           resultReg := RET_SUCCESS
+
           printf("[MyConvAccel] COMPUTE complete\n")
+
           state := sRespond
         }.otherwise {
           outRow := outRow + 1.U
@@ -350,79 +368,100 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     is(sStore) {
       // Write the 32x32 output matrix back to memory.
       // Use one 64-bit full store for every four 16-bit output elements.
-      // This avoids TileLink PutPartial transactions.
+      // Wait for the memory response before issuing the next store.
+      // This prevents the CPU from reading hw_output before accelerator stores complete.
+
+      val watchStoreIdx =
+        (storeIdx < 16.U) ||
+        (storeIdx === 416.U) ||
+        (storeIdx === 704.U) ||
+        (storeIdx === 832.U) ||
+        (storeIdx >= 1008.U)
 
       when(storeIdx < INPUT_ELEMS.U) {
-        io.mem.req.valid := true.B
+        when(!memInflight) {
+          io.mem.req.valid := true.B
 
-        // storeIdx is the starting int16 index of this 64-bit store.
-        // Byte offset = storeIdx * 2.
-        io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
+          // storeIdx is the starting int16 index of this 64-bit store.
+          // Byte offset = storeIdx * 2.
+          io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
 
-        io.mem.req.bits.tag := 2.U
-        io.mem.req.bits.cmd := M_XWR
+          io.mem.req.bits.tag := 2.U
+          io.mem.req.bits.cmd := M_XWR
 
-        // size = log2(bytes). 3 means 8 bytes = 64-bit full store.
-        io.mem.req.bits.size := 3.U
+          // size = log2(bytes). 3 means 8 bytes = 64-bit full store.
+          io.mem.req.bits.size := 3.U
 
-        io.mem.req.bits.signed := false.B
+          io.mem.req.bits.signed := false.B
 
-        // Pack four int16 outputs into one 64-bit word.
-        // Little-endian layout:
-        // bits [15:0]   -> outputBuf[storeIdx]
-        // bits [31:16]  -> outputBuf[storeIdx + 1]
-        // bits [47:32]  -> outputBuf[storeIdx + 2]
-        // bits [63:48]  -> outputBuf[storeIdx + 3]
-        io.mem.req.bits.data := Cat(
-          outputBuf((storeIdx + 3.U)(9, 0)).asUInt,
-          outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
-          outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
-          outputBuf(storeIdx(9, 0)).asUInt
-        )
-
-        // Debug only selected store indices to avoid huge logs.
-        val watchStoreIdx =
-          (storeIdx < 16.U) ||
-          (storeIdx === 704.U) ||
-          (storeIdx === 832.U) ||
-          (storeIdx >= 1008.U)
-
-        when(io.mem.req.valid && !io.mem.req.ready && watchStoreIdx) {
-          printf("[STORE_STALL] idx=%d addr=%x\n",
-            storeIdx,
-            outputAddrReg + (storeIdx << 1)
+          // Pack four int16 outputs into one 64-bit word.
+          // Little-endian layout:
+          // bits [15:0]   -> outputBuf[storeIdx]
+          // bits [31:16]  -> outputBuf[storeIdx + 1]
+          // bits [47:32]  -> outputBuf[storeIdx + 2]
+          // bits [63:48]  -> outputBuf[storeIdx + 3]
+          io.mem.req.bits.data := Cat(
+            outputBuf((storeIdx + 3.U)(9, 0)).asUInt,
+            outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
+            outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
+            outputBuf(storeIdx(9, 0)).asUInt
           )
-        }
 
-        when(io.mem.req.fire) {
-          when(watchStoreIdx) {
-            printf("[STORE_REQ] idx=%d addr=%x data=%x out0=%x out1=%x out2=%x out3=%x\n",
+          when(io.mem.req.valid && !io.mem.req.ready && watchStoreIdx) {
+            printf("[STORE_STALL] idx=%d addr=%x\n",
               storeIdx,
-              outputAddrReg + (storeIdx << 1),
-              io.mem.req.bits.data,
-              outputBuf(storeIdx(9, 0)).asUInt,
-              outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
-              outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
-              outputBuf((storeIdx + 3.U)(9, 0)).asUInt
+              outputAddrReg + (storeIdx << 1)
             )
           }
 
-          // Four int16 elements have been stored.
+          when(io.mem.req.fire) {
+            memInflight := true.B
+
+            when(watchStoreIdx) {
+              printf("[STORE_REQ] idx=%d addr=%x data=%x out0=%x out1=%x out2=%x out3=%x\n",
+                storeIdx,
+                outputAddrReg + (storeIdx << 1),
+                io.mem.req.bits.data,
+                outputBuf(storeIdx(9, 0)).asUInt,
+                outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
+                outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
+                outputBuf((storeIdx + 3.U)(9, 0)).asUInt
+              )
+            }
+          }
+        }
+
+        when(memInflight && io.mem.resp.valid) {
+          memInflight := false.B
+
+          when(watchStoreIdx) {
+            printf("[STORE_RESP] idx=%d\n", storeIdx)
+          }
+
+          // Four int16 elements have now completed their store response.
           storeIdx := storeIdx + 4.U
         }
 
       }.otherwise {
         resultReg := RET_SUCCESS
+
         printf("[MyConvAccel] STORE complete storeIdx=%d\n", storeIdx)
+
         state := sRespond
       }
     }
 
     is(sRespond) {
-      io.resp.valid := true.B
+      when(xdReg) {
+        io.resp.valid := true.B
 
-      when(io.resp.fire) {
-        printf("[MyConvAccel] RESP fire rd=%d data=%x\n", rdReg, resultReg)
+        when(io.resp.fire) {
+          printf("[MyConvAccel] RESP fire rd=%d data=%x\n", rdReg, resultReg)
+          state := sIdle
+        }
+
+      }.otherwise {
+        printf("[MyConvAccel] RESP skipped because xd=0 data=%x\n", resultReg)
         state := sIdle
       }
     }

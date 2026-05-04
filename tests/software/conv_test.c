@@ -178,10 +178,19 @@ static int run_test(const char *name, int kernel_size) {
     // --- Hardware accelerator (with cycle count) ---
      uint64_t t0, t1;
     uint64_t ret;
+    // Ensure CPU writes to input/kernel/output buffers are visible before RoCC LOAD.
+    asm volatile("fence rw, rw" ::: "memory");
+
     t0 = read_cycle();
- 
+
     ret = conv_config((uint64_t)kernel_size, hw_output);
     if (!ret) { printf("[%s] CONFIG failed\n", name); return 0; }
+
+    // Ensure CONFIG completes before LOAD.
+    asm volatile("fence rw, rw" ::: "memory");
+
+    ret = conv_load(input_buf, kernel_buf);
+    if (!ret) { printf("[%s] LOAD failed\n", name); return 0; }
  
     ret = conv_load(input_buf, kernel_buf);
     if (!ret) { printf("[%s] LOAD failed\n", name); return 0; }
@@ -197,7 +206,7 @@ static int run_test(const char *name, int kernel_size) {
     uint64_t hw_cycles = t1 - t0;
  
     // Fence: ensure CPU sees accelerator's memory writes
-    asm volatile("fence" ::: "memory");
+    asm volatile("fence rw, rw" ::: "memory");
  
     // --- Software reference (with cycle count) ---
     t0 = read_cycle();
