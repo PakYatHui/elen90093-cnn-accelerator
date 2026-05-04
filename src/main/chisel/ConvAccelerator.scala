@@ -130,7 +130,11 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     val colIdx = colS.asUInt
     val inputIndex = (rowIdx << 5) + colIdx
 
+<<<<<<< Updated upstream
     Mux(rowValid && colValid, inputBuf(inputIndex), 0.S(16.W))
+=======
+    Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)), 0.S(16.W))
+>>>>>>> Stashed changes
   }
 
   // Parallel MAC tree for one output element. The hardware contains the maximum
@@ -142,8 +146,15 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       val termIdx = kr * MAX_KERNEL_SIZE + kc
       val active = kr.U < kernelSizeReg && kc.U < kernelSizeReg
       val kernelIndex = kr.U(3.W) * kernelSizeReg + kc.U(3.W)
+<<<<<<< Updated upstream
       val inVal = getInputAt(outRow, outCol, kr, kc)
       val kerVal = kernelBuf(kernelIndex)
+=======
+
+      //用到上面函数，拿到原矩阵对应位置数值（含zero padding）
+      val inVal = getInputAt(outRow, outCol, kr, kc)//input阵时二维存储的
+      val kerVal = kernelBuf(kernelIndex(4, 0))//kernel是一维存储的
+>>>>>>> Stashed changes
 
       // 8.8 x 8.8 produces 16.16. Shift right by 8 to return to 8.8 scale.
       macTerms(termIdx) := Mux(active, (inVal * kerVal) >> 8, 0.S(32.W))
@@ -298,7 +309,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         val loadedData = io.mem.resp.bits.data(15, 0).asSInt
 
         when(issuedIsInput) {
-          inputBuf(issuedIndex) := loadedData
+          inputBuf(issuedIndex(9, 0)) := loadedData
           inputLoadIdx := inputLoadIdx + 1.U
         }.otherwise {
           kernelBuf(issuedIndex(4, 0)) := loadedData
@@ -311,7 +322,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
     is(sCompute) {
       // Compute one output element per cycle.
-      outputBuf(outIndex) := macOut16
+      outputBuf(outIndex(9, 0)) := macOut16
 
       when(outCol === (INPUT_SIZE - 1).U) {
         outCol := 0.U
@@ -329,6 +340,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       }
     }
 
+<<<<<<< Updated upstream
     is(sStore) {
       // Write the 32x32 output matrix back to memory.
       when(storeIdx < INPUT_ELEMS.U) {
@@ -339,16 +351,53 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         io.mem.req.bits.size := 1.U
         io.mem.req.bits.signed := true.B
         io.mem.req.bits.data := outputBuf(storeIdx).pad(xLen).asUInt
+=======
 
-        when(io.mem.req.fire) {
-          storeIdx := storeIdx + 1.U
-        }
-      }.otherwise {
-        resultReg := RET_SUCCESS
-        printf("[MyConvAccel] STORE complete\n")
-        state := sRespond
-      }
+
+is(sStore) {
+  // Write the 32x32 output matrix back to memory.
+  // Use one 64-bit full store for every four 16-bit output elements.
+  // This avoids TileLink PutPartial transactions.
+
+  when(storeIdx < INPUT_ELEMS.U) {
+    io.mem.req.valid := true.B
+>>>>>>> Stashed changes
+
+    // storeIdx is the starting int16 index of this 64-bit store.
+    // Byte offset = storeIdx * 2.
+    io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
+
+    io.mem.req.bits.tag := 2.U
+    io.mem.req.bits.cmd := M_XWR
+
+    // size = log2(bytes). 3 means 8 bytes = 64-bit full store.
+    io.mem.req.bits.size := 3.U
+
+    io.mem.req.bits.signed := false.B
+
+    // Pack four int16 outputs into one 64-bit word.
+    // Little-endian layout:
+    // bits [15:0]   -> outputBuf[storeIdx]
+    // bits [31:16]  -> outputBuf[storeIdx + 1]
+    // bits [47:32]  -> outputBuf[storeIdx + 2]
+    // bits [63:48]  -> outputBuf[storeIdx + 3]
+    io.mem.req.bits.data := Cat(
+      outputBuf((storeIdx + 3.U)(9, 0)).asUInt,
+      outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
+      outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
+      outputBuf(storeIdx(9, 0)).asUInt
+    )
+
+    when(io.mem.req.fire) {
+      // Four int16 elements have been stored.
+      storeIdx := storeIdx + 4.U
     }
+  }.otherwise {
+    resultReg := RET_SUCCESS
+    printf("[MyConvAccel] STORE complete\n")
+    state := sRespond
+  }
+}
 
     is(sRespond) {
       io.resp.valid := true.B
