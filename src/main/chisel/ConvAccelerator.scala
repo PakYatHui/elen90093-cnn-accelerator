@@ -7,6 +7,7 @@ import org.chipsalliance.cde.config._
 import org.chipsalliance.diplomacy.lazymodule._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.rocket._
+import hardfloat._
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
   println("DEBUG: Elaborating MyConvAccel")
@@ -30,14 +31,23 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val RET_ERROR   = 0.U(xLen.W)
   val RET_SUCCESS = 1.U(xLen.W)
 
+  // Data type encoding.
+  val DATA_FIXED16 = 0.U(2.W)
+  val DATA_FLOAT16 = 1.U(2.W)
+
+  // Float16 parameters for HardFloat.
+  val FP16_EXP_WIDTH = 5
+  val FP16_SIG_WIDTH = 11
+
   // funct7 encoding.
   val FUNCT_CONFIG  = 0.U(7.W)
-  val FUNCT_LOAD    = 1.U(7.W)
+  val FUNCT_DATA    = 1.U(7.W)
   val FUNCT_COMPUTE = 2.U(7.W)
   val FUNCT_STORE   = 3.U(7.W)
+  val FUNCT_KERNEL  = 4.U(7.W)
 
   // FSM states.
-  val sIdle :: sDecode :: sConfig :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(7)
+  val sIdle :: sDecode :: sConfig :: sKernel :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
   // Latched command fields.
@@ -52,21 +62,26 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val inputAddrReg   = RegInit(0.U(xLen.W))
   val kernelAddrReg  = RegInit(0.U(xLen.W))
   val outputAddrReg  = RegInit(0.U(xLen.W))
+  val biasAddrReg    = RegInit(0.U(xLen.W))
   val kernelSizeReg  = RegInit(0.U(3.W))
   val kernelElemsReg = RegInit(0.U(6.W))
+  val dataTypeReg    = RegInit(DATA_FIXED16)
+  val biasEnableReg  = RegInit(false.B)
 
   // Command-sequence protection flags.
-  val configuredReg = RegInit(false.B)
-  val loadedReg     = RegInit(false.B)
-  val computedReg   = RegInit(false.B)
+  val configuredReg       = RegInit(false.B)
+  val kernelConfiguredReg = RegInit(false.B)
+  val loadedReg           = RegInit(false.B)
+  val computedReg         = RegInit(false.B)
 
-  // Response register. The design only exposes success or error.
+  // Response register.
   val resultReg = RegInit(RET_ERROR)
 
   // Internal accelerator buffers.
-  val inputBuf  = Reg(Vec(INPUT_ELEMS, SInt(16.W)))
-  val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, SInt(16.W)))
-  val outputBuf = Reg(Vec(INPUT_ELEMS, SInt(16.W)))
+  // UInt(16.W) allows both fixed16 raw bits and float16 raw bits.
+  val inputBuf  = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
+  val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
+  val outputBuf = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
 
   // Load/store bookkeeping.
   val inputLoadIdx  = RegInit(0.U(11.W))
@@ -82,12 +97,16 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   // Helper wires.
   val doConfig  = functReg === FUNCT_CONFIG
-  val doLoad    = functReg === FUNCT_LOAD
+  val doData    = functReg === FUNCT_DATA
   val doCompute = functReg === FUNCT_COMPUTE
   val doStore   = functReg === FUNCT_STORE
+  val doKernel  = functReg === FUNCT_KERNEL
 
   val validKernelSize =
     (rs1Reg === 1.U) || (rs1Reg === 3.U) || (rs1Reg === 5.U)
+
+  val validDataType =
+    (rs2Reg(1, 0) === DATA_FIXED16) || (rs2Reg(1, 0) === DATA_FLOAT16)
 
   // Default command handshake.
   cmd.ready := false.B
@@ -122,9 +141,34 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     )
   }
 
-  // Return the input element selected by a variable-size centred kernel window.
+  // Float16 multiply using HardFloat.
+  def fp16Mul(a: UInt, b: UInt): UInt = {
+    val mul = Module(new MulRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
+
+    mul.io.a := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, a)
+    mul.io.b := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, b)
+    mul.io.roundingMode := 0.U(3.W)
+    mul.io.detectTininess := 0.U(1.W)
+
+    fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, mul.io.out)
+  }
+
+  // Float16 add using HardFloat.
+  def fp16Add(a: UInt, b: UInt): UInt = {
+    val add = Module(new AddRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
+
+    add.io.subOp := false.B
+    add.io.a := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, a)
+    add.io.b := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, b)
+    add.io.roundingMode := 0.U(3.W)
+    add.io.detectTininess := 0.U(1.W)
+
+    fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, add.io.out)
+  }
+
+  // Return fixed16 input value for the selected kernel window.
   // Out-of-range accesses implement zero padding.
-  def getInputAt(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): SInt = {
+  def getInputAtFixed(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): SInt = {
     val radius = kernelSizeReg >> 1
 
     val rowS = baseRow.zext + kr.S(4.W) - radius.zext
@@ -137,29 +181,69 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     val colIdx = colS.asUInt
     val inputIndex = (rowIdx << 5) + colIdx
 
-    Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)), 0.S(16.W))
+    Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)).asSInt, 0.S(16.W))
   }
 
-  // Parallel MAC tree for one output element.
-  val macTerms = Wire(Vec(MAX_KERNEL_ELEMS, SInt(32.W)))
+  // Return raw float16 bits for the selected kernel window.
+  // Out-of-range accesses return +0.0 half-precision.
+  def getInputAtFloat16(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): UInt = {
+    val radius = kernelSizeReg >> 1
+
+    val rowS = baseRow.zext + kr.S(4.W) - radius.zext
+    val colS = baseCol.zext + kc.S(4.W) - radius.zext
+
+    val rowValid = rowS >= 0.S && rowS < INPUT_SIZE.S
+    val colValid = colS >= 0.S && colS < INPUT_SIZE.S
+
+    val rowIdx = rowS.asUInt
+    val colIdx = colS.asUInt
+    val inputIndex = (rowIdx << 5) + colIdx
+
+    Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)), 0.U(16.W))
+  }
+
+  // Fixed16 MAC tree for one output element.
+  val fixedMacTerms = Wire(Vec(MAX_KERNEL_ELEMS, SInt(32.W)))
+
+  // Float16 MAC tree for one output element.
+  val floatMulTerms = Wire(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
 
   for (kr <- 0 until MAX_KERNEL_SIZE) {
     for (kc <- 0 until MAX_KERNEL_SIZE) {
       val termIdx = kr * MAX_KERNEL_SIZE + kc
       val active = kr.U < kernelSizeReg && kc.U < kernelSizeReg
       val kernelIndex = kr.U(3.W) * kernelSizeReg + kc.U(3.W)
-      val inVal = getInputAt(outRow, outCol, kr, kc)
-      val kerVal = kernelBuf(kernelIndex(4, 0))
+
+      // Fixed16 path.
+      val fixedInVal = getInputAtFixed(outRow, outCol, kr, kc)
+      val fixedKerVal = kernelBuf(kernelIndex(4, 0)).asSInt
 
       // 8.8 x 8.8 produces 16.16. Shift right by 8 to return to 8.8 scale.
-      macTerms(termIdx) := Mux(active, (inVal * kerVal) >> 8, 0.S(32.W))
+      fixedMacTerms(termIdx) := Mux(active, (fixedInVal * fixedKerVal) >> 8, 0.S(32.W))
+
+      // Float16 path.
+      val floatInVal = getInputAtFloat16(outRow, outCol, kr, kc)
+      val floatKerVal = kernelBuf(kernelIndex(4, 0))
+      val floatProduct = fp16Mul(floatInVal, floatKerVal)
+
+      floatMulTerms(termIdx) := Mux(active, floatProduct, 0.U(16.W))
     }
   }
 
-  val macSum = macTerms.reduce(_ + _)
+  val fixedMacSum = fixedMacTerms.reduce(_ + _)
 
-  // Keep the original truncation behaviour and store the lower 16 bits.
-  val macOut16 = (macSum.asUInt)(15, 0).asSInt
+  // Keep the original fixed16 truncation behaviour.
+  val fixedMacOut16 = fixedMacSum.asUInt(15, 0)
+
+  // Sum all float16 products.
+  val floatMacOut16 = floatMulTerms.reduce((a, b) => fp16Add(a, b))
+
+  val computeOut16 = Mux(
+    dataTypeReg === DATA_FLOAT16,
+    floatMacOut16,
+    fixedMacOut16
+  )
+
   val outIndex = (outRow << 5) + outCol
 
   switch(state) {
@@ -182,49 +266,69 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       when(doConfig) {
         state := sConfig
 
-      }.elsewhen(doLoad) {
+      }.elsewhen(doKernel) {
         when(configuredReg) {
-          inputAddrReg  := rs1Reg
-          kernelAddrReg := rs2Reg
-          inputLoadIdx  := 0.U
-          kernelLoadIdx := 0.U
-          memInflight   := false.B
-
-          printf("[MyConvAccel] Decode -> Load inputAddr=%x kernelAddr=%x kernelSize=%d\n",
-            rs1Reg, rs2Reg, kernelSizeReg)
-
-          state := sLoad
+          state := sKernel
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] LOAD rejected: accelerator is not configured\n")
+          printf("[MyConvAccel] KERNEL rejected: accelerator is not configured\n")
+          state := sRespond
+        }
+
+      }.elsewhen(doData) {
+        when(configuredReg && kernelConfiguredReg) {
+          when(biasEnableReg) {
+            resultReg := RET_ERROR
+            printf("[MyConvAccel] DATA rejected: bias datapath is not implemented yet\n")
+            state := sRespond
+
+          }.otherwise {
+            inputAddrReg  := rs1Reg
+            outputAddrReg := rs2Reg
+            inputLoadIdx  := 0.U
+            kernelLoadIdx := 0.U
+            memInflight   := false.B
+
+            printf("[MyConvAccel] Decode -> Data inputAddr=%x outputAddr=%x kernelAddr=%x kernelSize=%d dataType=%d biasEnable=%d\n",
+              rs1Reg, rs2Reg, kernelAddrReg, kernelSizeReg, dataTypeReg, biasEnableReg)
+
+            // Reuse the existing working load state.
+            state := sLoad
+          }
+
+        }.otherwise {
+          resultReg := RET_ERROR
+          printf("[MyConvAccel] DATA rejected: missing CONFIG or KERNEL\n")
           state := sRespond
         }
 
       }.elsewhen(doCompute) {
-        when(configuredReg && loadedReg) {
+        when(configuredReg && kernelConfiguredReg && loadedReg) {
           outRow := 0.U
           outCol := 0.U
 
-          printf("[MyConvAccel] Decode -> Compute kernelSize=%d\n", kernelSizeReg)
+          printf("[MyConvAccel] Decode -> Compute kernelSize=%d dataType=%d biasEnable=%d\n",
+            kernelSizeReg, dataTypeReg, biasEnableReg)
 
           state := sCompute
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] COMPUTE rejected: missing CONFIG or LOAD\n")
+          printf("[MyConvAccel] COMPUTE rejected: missing CONFIG, KERNEL, or DATA\n")
           state := sRespond
         }
 
       }.elsewhen(doStore) {
-        when(configuredReg && loadedReg && computedReg) {
+        when(configuredReg && kernelConfiguredReg && loadedReg && computedReg) {
           storeIdx := 0.U
           memInflight := false.B
 
-          printf("[MyConvAccel] Decode -> Store outputAddr=%x\n", outputAddrReg)
+          printf("[MyConvAccel] Decode -> Store outputAddr=%x dataType=%d\n",
+            outputAddrReg, dataTypeReg)
 
           state := sStore
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] STORE rejected: missing CONFIG, LOAD, or COMPUTE\n")
+          printf("[MyConvAccel] STORE rejected: missing CONFIG, KERNEL, DATA, or COMPUTE\n")
           state := sRespond
         }
 
@@ -236,9 +340,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sConfig) {
-      when(validKernelSize) {
+      when(validKernelSize && validDataType) {
         kernelSizeReg := rs1Reg(2, 0)
-        outputAddrReg := rs2Reg
+        dataTypeReg := rs2Reg(1, 0)
+        biasEnableReg := rs2Reg(2)
 
         when(rs1Reg === 1.U) {
           kernelElemsReg := 1.U
@@ -249,27 +354,50 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         }
 
         configuredReg := true.B
+        kernelConfiguredReg := false.B
         loadedReg := false.B
         computedReg := false.B
         resultReg := RET_SUCCESS
 
-        printf("[MyConvAccel] CONFIG success kernelSize=%d outputAddr=%x\n", rs1Reg, rs2Reg)
+        printf("[MyConvAccel] CONFIG success kernelSize=%d dataType=%d biasEnable=%d\n",
+          rs1Reg, rs2Reg(1, 0), rs2Reg(2))
+
       }.otherwise {
         configuredReg := false.B
+        kernelConfiguredReg := false.B
         loadedReg := false.B
         computedReg := false.B
         kernelSizeReg := 0.U
         kernelElemsReg := 0.U
+        dataTypeReg := DATA_FIXED16
+        biasEnableReg := false.B
         resultReg := RET_ERROR
 
-        printf("[MyConvAccel] CONFIG error invalid kernelSize=%d\n", rs1Reg)
+        printf("[MyConvAccel] CONFIG error kernelSize=%d dataType=%d\n",
+          rs1Reg, rs2Reg(1, 0))
       }
+
+      state := sRespond
+    }
+
+    is(sKernel) {
+      kernelAddrReg := rs1Reg
+      biasAddrReg := rs2Reg
+
+      kernelConfiguredReg := true.B
+      loadedReg := false.B
+      computedReg := false.B
+      resultReg := RET_SUCCESS
+
+      printf("[MyConvAccel] KERNEL success kernelAddr=%x biasAddr=%x biasEnable=%d\n",
+        rs1Reg, rs2Reg, biasEnableReg)
 
       state := sRespond
     }
 
     is(sLoad) {
       // Issue one read at a time: first the 32x32 input, then the active kernel.
+      // Both fixed16 and float16 use 16-bit elements, so the original memory flow is preserved.
       when(!memInflight) {
         when(inputLoadIdx < INPUT_ELEMS.U) {
           io.mem.req.valid := true.B
@@ -304,14 +432,14 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           computedReg := false.B
           resultReg := RET_SUCCESS
 
-          printf("[MyConvAccel] LOAD complete\n")
+          printf("[MyConvAccel] DATA/LOAD complete\n")
 
           state := sRespond
         }
       }
 
       when(io.mem.resp.valid) {
-        val loadedData = io.mem.resp.bits.data(15, 0).asSInt
+        val loadedData = io.mem.resp.bits.data(15, 0)
 
         when(issuedIsInput) {
           inputBuf(issuedIndex(9, 0)) := loadedData
@@ -327,7 +455,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
     is(sCompute) {
       // Compute one output element per cycle.
-      outputBuf(outIndex(9, 0)) := macOut16
+      outputBuf(outIndex(9, 0)) := computeOut16
 
       val watchComputeIdx =
         (outIndex < 4.U) ||
@@ -337,12 +465,12 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         (outIndex >= 1020.U)
 
       when(watchComputeIdx) {
-        printf("[COMPUTE_DBG] idx=%d row=%d col=%d macSum=%x macOut=%x\n",
+        printf("[COMPUTE_DBG] idx=%d row=%d col=%d dataType=%d out=%x\n",
           outIndex,
           outRow,
           outCol,
-          macSum.asUInt,
-          macOut16.asUInt
+          dataTypeReg,
+          computeOut16
         )
       }
 
@@ -367,9 +495,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
     is(sStore) {
       // Write the 32x32 output matrix back to memory.
+      // Both fixed16 and float16 use 16-bit elements.
       // Use one 64-bit full store for every four 16-bit output elements.
-      // Wait for the memory response before issuing the next store.
-      // This prevents the CPU from reading hw_output before accelerator stores complete.
 
       val watchStoreIdx =
         (storeIdx < 16.U) ||
@@ -382,7 +509,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         when(!memInflight) {
           io.mem.req.valid := true.B
 
-          // storeIdx is the starting int16 index of this 64-bit store.
+          // storeIdx is the starting 16-bit element index of this 64-bit store.
           // Byte offset = storeIdx * 2.
           io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
 
@@ -394,17 +521,12 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
           io.mem.req.bits.signed := false.B
 
-          // Pack four int16 outputs into one 64-bit word.
-          // Little-endian layout:
-          // bits [15:0]   -> outputBuf[storeIdx]
-          // bits [31:16]  -> outputBuf[storeIdx + 1]
-          // bits [47:32]  -> outputBuf[storeIdx + 2]
-          // bits [63:48]  -> outputBuf[storeIdx + 3]
+          // Pack four 16-bit outputs into one 64-bit word.
           io.mem.req.bits.data := Cat(
-            outputBuf((storeIdx + 3.U)(9, 0)).asUInt,
-            outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
-            outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
-            outputBuf(storeIdx(9, 0)).asUInt
+            outputBuf((storeIdx + 3.U)(9, 0)),
+            outputBuf((storeIdx + 2.U)(9, 0)),
+            outputBuf((storeIdx + 1.U)(9, 0)),
+            outputBuf(storeIdx(9, 0))
           )
 
           when(io.mem.req.valid && !io.mem.req.ready && watchStoreIdx) {
@@ -422,10 +544,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
                 storeIdx,
                 outputAddrReg + (storeIdx << 1),
                 io.mem.req.bits.data,
-                outputBuf(storeIdx(9, 0)).asUInt,
-                outputBuf((storeIdx + 1.U)(9, 0)).asUInt,
-                outputBuf((storeIdx + 2.U)(9, 0)).asUInt,
-                outputBuf((storeIdx + 3.U)(9, 0)).asUInt
+                outputBuf(storeIdx(9, 0)),
+                outputBuf((storeIdx + 1.U)(9, 0)),
+                outputBuf((storeIdx + 2.U)(9, 0)),
+                outputBuf((storeIdx + 3.U)(9, 0))
               )
             }
           }
@@ -438,7 +560,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             printf("[STORE_RESP] idx=%d\n", storeIdx)
           }
 
-          // Four int16 elements have now completed their store response.
+          // Four 16-bit elements have now completed their store response.
           storeIdx := storeIdx + 4.U
         }
 

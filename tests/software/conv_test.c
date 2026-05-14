@@ -5,8 +5,11 @@
 // Tests 1x1, 3x3, and 5x5 convolution by comparing accelerator output
 // against a software reference implementation.
 //
-// Fixed-point format: 8.8 signed (1 sign bit, 7 integer bits, 8 fraction bits)
+// Fixed-point format: 8.8 signed
 // All matrices are 32x32 elements of int16_t.
+//
+// Minimal update for new command interface:
+// CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE
 // =============================================================================
 
 #include <stdio.h>
@@ -15,85 +18,101 @@
 #include "rocc.h"
 
 // =============================================================================
-// Hardware parameters (must match ConvAccelerator.scala)
+// Hardware parameters
 // =============================================================================
 #define INPUT_SIZE   32
-#define INPUT_ELEMS  (INPUT_SIZE * INPUT_SIZE)   // 1024
+#define INPUT_ELEMS  (INPUT_SIZE * INPUT_SIZE)
 
-// funct7 encodings (must match ConvAccelerator.scala)
+// funct7 encodings
 #define FUNCT_CONFIG  0
-#define FUNCT_LOAD    1
+#define FUNCT_DATA    1
 #define FUNCT_COMPUTE 2
 #define FUNCT_STORE   3
+#define FUNCT_KERNEL  4
 
 // RoCC uses custom0 opcode
 #define ROCC_X 0
 
-// =============================================================================
-// Fixed-point helpers (8.8 format)
-// =============================================================================
-// Convert a double to 8.8 fixed-point int16_t
+// Data type encoding
+#define DATA_FIXED16 0
+#define DATA_FLOAT32 1
 
+// CONFIG rs2 layout:
+// bits [1:0] = data type
+// bit  [2]   = bias enable
+#define CONFIG_FLAGS(data_type, bias_enable) \
+    (((uint64_t)(data_type) & 0x3ULL) | ((((uint64_t)(bias_enable)) & 0x1ULL) << 2))
 
-//这部分是宏定义，负责将将整数“转换”成8.8,之后再转换回来变成double
+// =============================================================================
+// Fixed-point helpers
+// =============================================================================
 #define TO_FP(x)   ((int16_t)((x) * 256.0))
-
-// Convert 8.8 fixed-point back to double (for printing)
 #define FROM_FP(x) ((double)(x) / 256.0)
-
 
 // Forward declaration
 static int check_output(const char *test_name);
-
 
 // =============================================================================
 // RoCC instruction wrappers
 // =============================================================================
 
-// CONFIG: rs1 = kernel_size, rs2 = output_addr, returns success/error in rd
-static inline uint64_t conv_config(uint64_t kernel_size, void *output_addr) {
+// CONFIG:
+// rs1 = kernel_size
+// rs2 = config flags: data type + bias enable
+static inline uint64_t conv_config(uint64_t kernel_size, uint64_t config_flags) {
     uint64_t ret;
     ROCC_INSTRUCTION_DSS(ROCC_X, ret,
-                         kernel_size, (uint64_t)output_addr,
+                         kernel_size, config_flags,
                          FUNCT_CONFIG);
     return ret;
 }
 
-// LOAD: rs1 = input_addr, rs2 = kernel_addr, returns success/error in rd
-static inline uint64_t conv_load(void *input_addr, void *kernel_addr) {
+// KERNEL:
+// rs1 = kernel weight address
+// rs2 = bias address
+static inline uint64_t conv_kernel(void *kernel_addr, void *bias_addr) {
     uint64_t ret;
     ROCC_INSTRUCTION_DSS(ROCC_X, ret,
-                         (uint64_t)input_addr, (uint64_t)kernel_addr,
-                         FUNCT_LOAD);
+                         (uint64_t)kernel_addr, (uint64_t)bias_addr,
+                         FUNCT_KERNEL);
     return ret;
 }
 
-// COMPUTE: no operands, returns success/error in rd
+// DATA:
+// rs1 = input data address
+// rs2 = output data address
+// This replaces the old LOAD command at software-interface level.
+static inline uint64_t conv_data(void *input_addr, void *output_addr) {
+    uint64_t ret;
+    ROCC_INSTRUCTION_DSS(ROCC_X, ret,
+                         (uint64_t)input_addr, (uint64_t)output_addr,
+                         FUNCT_DATA);
+    return ret;
+}
+
+// COMPUTE:
+// no operands
 static inline uint64_t conv_compute(void) {
     uint64_t ret;
     ROCC_INSTRUCTION_D(ROCC_X, ret, FUNCT_COMPUTE);
     return ret;
 }
 
-// STORE: no operands, returns success/error in rd
+// STORE:
+// no operands
 static inline uint64_t conv_store(void) {
     uint64_t ret;
     ROCC_INSTRUCTION_D(ROCC_X, ret, FUNCT_STORE);
     return ret;
 }
 
-
-
-
-
-
 // =============================================================================
-//golden reference用CPU计算的结果sw——out
+// Software golden reference
 // =============================================================================
 static void sw_conv(
-    const int16_t *input,       // INPUT_SIZE x INPUT_SIZE
-    const int16_t *kernel,      // kernel_size x kernel_size
-    int16_t       *output,      // INPUT_SIZE x INPUT_SIZE
+    const int16_t *input,
+    const int16_t *kernel,
+    int16_t       *output,
     int            kernel_size)
 {
     int radius = kernel_size / 2;
@@ -107,7 +126,7 @@ static void sw_conv(
                     int in_row = row + kr - radius;
                     int in_col = col + kc - radius;
 
-                    int16_t in_val = 0;   // zero padding
+                    int16_t in_val = 0;
                     if (in_row >= 0 && in_row < INPUT_SIZE &&
                         in_col >= 0 && in_col < INPUT_SIZE) {
                         in_val = input[in_row * INPUT_SIZE + in_col];
@@ -115,188 +134,164 @@ static void sw_conv(
 
                     int16_t ker_val = kernel[kr * kernel_size + kc];
 
-                    // 8.8 x 8.8 -> shift right 8 to stay in 8.8
+                    // 8.8 x 8.8 produces 16.16.
+                    // Shift right by 8 to return to 8.8 scale.
                     sum += ((int32_t)in_val * (int32_t)ker_val) >> 8;
                 }
             }
 
-            // Truncate to lower 16 bits (matches macOut16 in Scala)
+            // Match the hardware truncation behaviour.
             output[row * INPUT_SIZE + col] = (int16_t)(sum & 0xFFFF);
         }
     }
 }
 
 // =============================================================================
-// Test data buffers (static so they land in BSS/data, not stack)
+// Test data buffers
 // =============================================================================
-static int16_t input_buf [INPUT_ELEMS]    __attribute__((aligned(64)));
-static int16_t kernel_buf[5 * 5]          __attribute__((aligned(64)));
-static int16_t hw_output [INPUT_ELEMS]    __attribute__((aligned(64)));
-static int16_t sw_output [INPUT_ELEMS]    __attribute__((aligned(64)));
-
-
-
+static int16_t input_buf [INPUT_ELEMS] __attribute__((aligned(64)));
+static int16_t kernel_buf[5 * 5]       __attribute__((aligned(64)));
+static int16_t hw_output [INPUT_ELEMS] __attribute__((aligned(64)));
+static int16_t sw_output [INPUT_ELEMS] __attribute__((aligned(64)));
 
 static inline uint64_t read_cycle(void) {
     uint64_t cycle;
     asm volatile ("rdcycle %0" : "=r"(cycle));
     return cycle;
 }
-// =============================================================================
-// Run one complete test: fill buffers, run HW + SW, compare
-// =============================================================================
 
-//生成原始矩阵（aij=i+j)和kernel（kij只在中心为1，即图像不变）
+// =============================================================================
+// Run one complete test
+// =============================================================================
 static int run_test(const char *name, int kernel_size) {
     memset(hw_output, 0, sizeof(hw_output));
-    
+    memset(sw_output, 0, sizeof(sw_output));
+
     printf("\n=== %s (kernel=%dx%d) ===\n", name, kernel_size, kernel_size);
 
-    // --- Fill input: value at (row, col) = row + col (in 8.8 fixed-point) ---
-    for (int row = 0; row < INPUT_SIZE; row++)
-        for (int col = 0; col < INPUT_SIZE; col++)
+    // Fill input: value at (row, col) = row + col.
+    for (int row = 0; row < INPUT_SIZE; row++) {
+        for (int col = 0; col < INPUT_SIZE; col++) {
             input_buf[row * INPUT_SIZE + col] = TO_FP(row + col);
+        }
+    }
 
-    // --- Fill kernel: identity-like, centre = 1.0, rest = 0 (for 1x1 always 1) ---
-   // int k_elems = kernel_size * kernel_size;
+    // Fill kernel: identity-like kernel.
     memset(kernel_buf, 0, sizeof(kernel_buf));
+
     if (kernel_size == 1) {
         kernel_buf[0] = TO_FP(1.0);
     } else {
-        // Centre element = 1.0, others stay 0 (acts as identity convolution)
         int centre = (kernel_size / 2) * kernel_size + (kernel_size / 2);
         kernel_buf[centre] = TO_FP(1.0);
     }
 
-
-
-
-    //RUN并且测试性能（用print方式呈现，不返回）
-    // // --- Software reference ---
-    // sw_conv(input_buf, kernel_buf, sw_output, kernel_size);
-
-    // --- Hardware accelerator (with cycle count) ---
-     uint64_t t0, t1;
+    uint64_t t0, t1;
     uint64_t ret;
-    // Ensure CPU writes to input/kernel/output buffers are visible before RoCC LOAD.
+
+    // Ensure CPU writes to input/kernel/output buffers are visible.
     asm volatile("fence rw, rw" ::: "memory");
 
     t0 = read_cycle();
 
-    ret = conv_config((uint64_t)kernel_size, hw_output);
-    if (!ret) { printf("[%s] CONFIG failed\n", name); return 0; }
+    // CONFIG: fixed16, no bias.
+    ret = conv_config((uint64_t)kernel_size,
+                      CONFIG_FLAGS(DATA_FIXED16, 0));
+    if (!ret) {
+        printf("[%s] CONFIG failed\n", name);
+        return 0;
+    }
 
-    // Ensure CONFIG completes before LOAD.
     asm volatile("fence rw, rw" ::: "memory");
 
-    ret = conv_load(input_buf, kernel_buf);
-    if (!ret) { printf("[%s] LOAD failed\n", name); return 0; }
- 
-    ret = conv_load(input_buf, kernel_buf);
-    if (!ret) { printf("[%s] LOAD failed\n", name); return 0; }
- 
+    // KERNEL: kernel address + bias address.
+    // Bias is disabled, so bias address is zero.
+    ret = conv_kernel(kernel_buf, (void *)0);
+    if (!ret) {
+        printf("[%s] KERNEL failed\n", name);
+        return 0;
+    }
+
+    asm volatile("fence rw, rw" ::: "memory");
+
+    // DATA: input address + output address.
+    // Internally this should trigger the existing sLoad logic.
+    ret = conv_data(input_buf, hw_output);
+    if (!ret) {
+        printf("[%s] DATA failed\n", name);
+        return 0;
+    }
+
     ret = conv_compute();
-    if (!ret) { printf("[%s] COMPUTE failed\n", name); return 0; }
- 
+    if (!ret) {
+        printf("[%s] COMPUTE failed\n", name);
+        return 0;
+    }
+
     ret = conv_store();
-    if (!ret) { printf("[%s] STORE failed\n", name); return 0; }
- 
+    if (!ret) {
+        printf("[%s] STORE failed\n", name);
+        return 0;
+    }
+
     t1 = read_cycle();
-    
+
     uint64_t hw_cycles = t1 - t0;
- 
-    // Fence: ensure CPU sees accelerator's memory writes
+
+    // Ensure CPU sees accelerator memory writes.
     asm volatile("fence rw, rw" ::: "memory");
- 
-    // --- Software reference (with cycle count) ---
+
+    // Software reference.
     t0 = read_cycle();
     sw_conv(input_buf, kernel_buf, sw_output, kernel_size);
     t1 = read_cycle();
+
     uint64_t sw_cycles = t1 - t0;
- 
-    // --- Performance report ---
+
     printf("  HW cycles: %lu\n", (unsigned long)hw_cycles);
     printf("  SW cycles: %lu\n", (unsigned long)sw_cycles);
-    if (hw_cycles > 0)
+
+    if (hw_cycles > 0) {
         printf("  Speedup:   %lu x\n", (unsigned long)(sw_cycles / hw_cycles));
- 
-    // --- Correctness check ---
+    }
+
     return check_output(name);
 }
- 
 
 // =============================================================================
-// Performance measurement using rdcycle
-// =============================================================================
-
-
-
-
-// static void perf_test(int kernel_size) {
-//     printf("\n=== Performance: kernel=%dx%d ===\n", kernel_size, kernel_size);
-
-//     // Use the same input and kernel as the last run_test call
-//     // (buffers are still filled from previous test)
-
-//     uint64_t t0, t1;
-
-
-
-
-//     // Hardware
-//     t0 = read_cycle();
-//     conv_config((uint64_t)kernel_size, hw_output);
-//     conv_load(input_buf, kernel_buf);
-//     conv_compute();
-//     conv_store();
-//     t1 = read_cycle();
-//     uint64_t hw_cycles = t1 - t0;
-
-//     // Software
-//     t0 = read_cycle();
-//     sw_conv(input_buf, kernel_buf, sw_output, kernel_size);
-//     t1 = read_cycle();
-//     uint64_t sw_cycles = t1 - t0;
-
-//     printf("  HW cycles: %llu\n", (unsigned long long)hw_cycles);
-//     printf("  SW cycles: %llu\n", (unsigned long long)sw_cycles);
-//     if (hw_cycles > 0)
-//         printf("  Speedup:   %.2fx\n", (double)sw_cycles / (double)hw_cycles);
-// }
-
-
-// =============================================================================
-// Compare hw and sw output, print first mismatch if any
+// Compare hardware and software output
 // =============================================================================
 static int check_output(const char *test_name) {
-
-    
-    // 打印前9个元素对比
     printf("[%s] First 8 outputs:\n", test_name);
     printf("  idx | sw_output        | hw_output\n");
+
     for (int i = 0; i < 9; i++) {
         printf("  [%d] | 0x%04x (%.4f) | 0x%04x (%.4f)\n",
                i,
                (uint16_t)sw_output[i], FROM_FP(sw_output[i]),
                (uint16_t)hw_output[i], FROM_FP(hw_output[i]));
-    
-        }
-    
-  
+    }
+
     int pass = 1;
+
     for (int i = 0; i < INPUT_ELEMS; i++) {
         if (hw_output[i] != sw_output[i]) {
             printf("[%s] MISMATCH at [%d][%d]: hw=0x%04x (%.4f) sw=0x%04x (%.4f)\n",
                    test_name,
-                   i / INPUT_SIZE, i % INPUT_SIZE,
+                   i / INPUT_SIZE,
+                   i % INPUT_SIZE,
                    (uint16_t)hw_output[i], FROM_FP(hw_output[i]),
                    (uint16_t)sw_output[i], FROM_FP(sw_output[i]));
+
             pass = 0;
-            break;   // stop at first mismatch
+            break;
         }
     }
-    if (pass)
+
+    if (pass) {
         printf("[%s] PASS - all %d outputs match\n", test_name, INPUT_ELEMS);
+    }
+
     return pass;
 }
 
@@ -308,14 +303,11 @@ int main(void) {
 
     int all_pass = 1;
 
-    // Functional tests
     all_pass &= run_test("Test1_1x1", 1);
     all_pass &= run_test("Test2_3x3", 3);
     all_pass &= run_test("Test3_5x5", 5);
 
-    // Performance measurement (uses 5x5 buffers from last test)
-   // perf_test(5);
-
     printf("\n=== Final Result: %s ===\n", all_pass ? "ALL PASS" : "SOME FAILED");
+
     return 0;
 }
