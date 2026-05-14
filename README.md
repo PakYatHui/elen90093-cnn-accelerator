@@ -9,33 +9,35 @@
 
 This project implements a RISC-V RoCC-based CNN convolution accelerator for 32x32 matrix convolution.
 
-The accelerator originally supported signed 16-bit fixed-point 8.8 convolution. The current version extends the interface and datapath structure to support both fixed-point 8.8 and IEEE-754 half-precision floating point (`float16`) data formats.
+The accelerator started as a signed 16-bit fixed-point 8.8 convolution accelerator. The current development version extends the design with a cleaner command interface and a selectable data type path for both fixed-point 8.8 and IEEE-754 half-precision floating point (`Float16`).
 
-The accelerator supports runtime kernel-size configuration for 1x1, 3x3, and 5x5 kernels, zero padding, and a RoCC custom instruction interface.
+The accelerator supports runtime kernel-size configuration for 1x1, 3x3, and 5x5 convolution kernels. It uses zero padding for boundary elements and communicates with the RISC-V core through a RoCC custom instruction interface.
 
 ## Version and Status
 
 ```text
-Version: v0.3 - Float16 Interface and Datapath Extension
+Version: v0.3 - Interface Refactor and Float16 Datapath Extension
 Branch: feature/accelerator-fsm
-Status: Fixed16 and Float16 tests compile and run in Chipyard simulation
+Status: Updated command interface tested; Fixed16 path preserved; Float16 path added for validation
 ```
 
-The accelerator has been compiled in Chipyard simulation with the updated command interface.
+The current version focuses on two major updates:
 
-The updated interface has been tested using the fixed-point functional test. A new `conv_float_test.c` test has also been added for the Float16 data path.
+1. Refactoring the accelerator command interface from the old CONFIG / LOAD / COMPUTE / STORE model into a clearer CONFIG / KERNEL / DATA / COMPUTE / STORE model.
+2. Extending the internal datapath so the accelerator can select between fixed-point 8.8 and Float16 computation.
+
+The fixed-point path remains the baseline working path. The Float16 path has been added and should be validated further using different kernels and CNN-style workloads.
 
 ## Supported Features
 
 - 32x32 input matrix
 - 32x32 output matrix
 - 1x1, 3x3, and 5x5 convolution kernels
-- 16-bit signed fixed-point 8.8 data path
-- 16-bit IEEE-754 half-precision Float16 data path
-- Zero padding for boundary elements
 - Runtime kernel-size configuration
 - Runtime data-type configuration
-- Bias control interface through `biasEnableReg` and `biasAddrReg`
+- Signed 16-bit fixed-point 8.8 data path
+- IEEE-754 half-precision Float16 data path
+- Zero padding for boundary elements
 - RoCC custom instruction interface
 - Success/error response through `rd`
 - Internal input buffer
@@ -44,52 +46,84 @@ The updated interface has been tested using the fixed-point functional test. A n
 - Real memory load through `io.mem.req` and `io.mem.resp`
 - Real memory store through `io.mem.req` and `io.mem.resp`
 - 64-bit full-width stores to avoid TileLink PutPartial transactions
-- 25-MAC datapath for maximum 5x5 convolution
+- 25-term convolution datapath for maximum 5x5 kernels
 - Runtime masking for smaller kernels
 - Basic command-sequence checking
+- Bias interface registers prepared for later bias support
 
 ## Current Limitations
 
-- Bias is currently exposed through the interface, but bias computation is not yet implemented.
-- If `biasEnableReg = 1`, the current design rejects the DATA command and returns an error.
-- Float16 computation uses HardFloat modules and should be validated with simple kernels before using more complex filters.
-- Float16 and fixed16 currently share the same 16-bit memory layout, so memory load and store width remain unchanged.
+- Bias address and bias enable are exposed in the interface, but bias computation is not implemented yet.
+- If bias is enabled, the current design rejects the DATA command and returns an error.
+- Float16 computation has been added using HardFloat modules, but it needs more testing with non-identity kernels.
+- The current Float16 test is mainly a functional validation path, not a full CNN benchmark.
+- The accelerator currently targets one 32x32 input matrix and one output matrix.
+- Performance optimization is not the current focus; correctness and interface stability come first.
 
 ## Major Updates in v0.3
 
-- Reworked the RoCC software interface from the old four-command flow:
+### Command interface refactor
+
+The old command sequence was:
 
 ```text
 CONFIG -> LOAD -> COMPUTE -> STORE
 ```
 
-- Updated the command flow to the new five-command interface:
+The new command sequence is:
 
 ```text
 CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE
 ```
 
-- Changed `CONFIG` to configure kernel size, data type, and bias enable.
-- Added a new `KERNEL` command to configure kernel weight address and bias address.
-- Changed the old `LOAD` command into a `DATA` command.
-- `DATA` now sets the input data address and output data address, then reuses the existing internal load state.
-- Preserved the existing `sLoad`, `sCompute`, and `sStore` flow as much as possible.
-- Changed accelerator buffers from signed 16-bit values to raw 16-bit values:
+This separates the accelerator configuration into clearer categories:
 
-```scala
-Reg(Vec(..., UInt(16.W)))
+```text
+CONFIG = kernel size, data type, bias enable
+KERNEL = kernel weight address, bias address
+DATA   = input data address, output data address
 ```
 
-- Added runtime data-type selection:
+The DATA command replaces the old LOAD command at the software-interface level. Internally, the accelerator still reuses the existing load state to read input data and kernel weights into internal buffers.
+
+### Data type extension
+
+The accelerator now supports two data type modes:
 
 ```text
 DATA_FIXED16 = 0
 DATA_FLOAT16 = 1
 ```
 
-- Added a Float16 computation path using HardFloat.
-- Added `conv_float_test.c` for Float16 functional testing.
-- Kept the original `conv_test.c` for fixed-point 8.8 testing.
+The internal buffers were changed from signed 16-bit storage to raw 16-bit storage:
+
+```scala
+Reg(Vec(..., UInt(16.W)))
+```
+
+This allows the same memory layout to hold either:
+
+```text
+fixed-point 8.8 raw bits
+Float16 raw bits
+```
+
+Fixed-point computation interprets the buffer values as signed 16-bit 8.8 values.
+
+Float16 computation interprets the buffer values as IEEE-754 half-precision values and uses HardFloat-based floating-point multiply/add logic.
+
+### Test update
+
+Two software tests are now maintained:
+
+```text
+tests/software/conv_test.c
+tests/software/conv_float_test.c
+```
+
+`conv_test.c` is the fixed-point 8.8 test.
+
+`conv_float_test.c` is the Float16 test using `uint16_t` raw half-precision values.
 
 ## Main Accelerator File
 
@@ -105,13 +139,9 @@ Chipyard compile location:
 ~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
 ```
 
-Important:
+The GitHub project file is used for version control. The Chipyard file is the one actually compiled by Chipyard.
 
-The GitHub project file is used for version control.
-
-The Chipyard file is the one actually compiled by Chipyard.
-
-When testing the accelerator in Chipyard, copy the GitHub file into the Chipyard compile location.
+When testing the accelerator in Chipyard, copy the GitHub file into the Chipyard compile location:
 
 ```bash
 cp ~/elen90093-cnn-accelerator/src/main/chisel/ConvAccelerator.scala \
@@ -132,7 +162,17 @@ rs2 = config flags
 rd  = 1 for success, 0 for error
 ```
 
-`rs2` config flag layout:
+The CONFIG command sets the convolution mode.
+
+`rs1` selects the kernel size:
+
+```text
+1 = 1x1 kernel
+3 = 3x3 kernel
+5 = 5x5 kernel
+```
+
+`rs2` stores config flags:
 
 ```text
 rs2[1:0] = data type
@@ -146,6 +186,20 @@ Data type encoding:
 1 = DATA_FLOAT16
 ```
 
+### KERNEL
+
+```text
+funct7 = 4
+Command = KERNEL
+rs1 = kernel weight address
+rs2 = bias address
+rd  = 1 for success, 0 for error
+```
+
+The KERNEL command stores the kernel weight address and bias address.
+
+The bias address is recorded for future use. Bias computation is not currently active.
+
 ### DATA
 
 ```text
@@ -156,8 +210,14 @@ rs2 = output data address
 rd  = 1 for success, 0 for error
 ```
 
-The DATA command replaces the old LOAD command at the software-interface level.
-Internally, the accelerator still enters the existing memory-load state to read input data and kernel weights into internal buffers.
+The DATA command sets the input and output matrix addresses.
+
+After the DATA command is accepted, the accelerator enters its internal memory-load state and reads:
+
+```text
+input matrix data
+kernel weight data
+```
 
 ### COMPUTE
 
@@ -169,6 +229,8 @@ rs2 = unused
 rd  = 1 for success, 0 for error
 ```
 
+The COMPUTE command runs convolution using the selected data type.
+
 ### STORE
 
 ```text
@@ -179,19 +241,11 @@ rs2 = unused
 rd  = 1 for success, 0 for error
 ```
 
-### KERNEL
-
-```text
-funct7 = 4
-Command = KERNEL
-rs1 = kernel weight address
-rs2 = bias address
-rd  = 1 for success, 0 for error
-```
-
-The bias address is recorded for future bias support. Bias computation is not enabled yet.
+The STORE command writes the output matrix back to memory.
 
 ## Required Command Order
+
+The required command order is:
 
 ```c
 conv_config(kernel_size, config_flags);
@@ -235,7 +289,7 @@ This ensures that the custom instruction sets `xd = 1` when a response through `
 
 ## Software Tests
 
-### Fixed-point test
+### Fixed-point functional test
 
 ```text
 tests/software/conv_test.c
@@ -254,13 +308,7 @@ This test:
 - tests 1x1, 3x3, and 5x5 kernels
 - reports hardware and software cycle counts
 
-Expected final result:
-
-```text
-=== Final Result: ALL PASS ===
-```
-
-### Float16 test
+### Float16 functional test
 
 ```text
 tests/software/conv_float_test.c
@@ -270,16 +318,12 @@ This test:
 
 - stores Float16 values as raw `uint16_t` bits
 - configures the accelerator for `DATA_FLOAT16`
-- uses the new CONFIG / KERNEL / DATA / COMPUTE / STORE command sequence
+- uses the CONFIG / KERNEL / DATA / COMPUTE / STORE command sequence
 - runs 1x1, 3x3, and 5x5 identity-style convolution tests
-- computes a CPU reference using Float32 helper conversion and half-precision rounding helpers
+- computes a CPU-side reference using Float32 helper conversion and half-precision rounding helpers
 - compares hardware and software raw Float16 output bits
 
-Expected final result:
-
-```text
-=== Final Result: ALL PASS ===
-```
+The Float16 test should be expanded with more kernels and edge cases before being treated as complete CNN validation.
 
 ## Build and Run Instructions
 
@@ -323,6 +367,13 @@ riscv64-unknown-elf-gcc \
   -o conv_float_test.riscv
 ```
 
+### Copy the accelerator into Chipyard
+
+```bash
+cp ~/elen90093-cnn-accelerator/src/main/chisel/ConvAccelerator.scala \
+~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
+```
+
 ### Build the Chipyard simulator
 
 ```bash
@@ -352,27 +403,53 @@ make CONFIG=MyConvAccelConfig \
   TIMEOUT_CYCLES=100000000
 ```
 
-`TIMEOUT_CYCLES=100000000` is used because the 5x5 software reference and accelerator simulation can take a long time in Verilator.
+`TIMEOUT_CYCLES=100000000` is used because the 5x5 software reference and Verilator simulation can take a long time.
 
 ## Repository Structure
 
 ```text
-src/      Chisel and Scala source code for the accelerator.
-tests/    Software and hardware tests.
-docs/     Project notes, setup instructions, and accelerator documentation.
-reports/  Report materials and figures.
-scripts/  Helper scripts.
+src/      Chisel and Scala source code for the accelerator
+tests/    Software and hardware tests
+docs/     Project notes, setup instructions, and accelerator documentation
+reports/  Report materials and figures
+scripts/  Helper scripts
 ```
 
 ## Next Steps
 
-- Add bias load and bias addition to the compute datapath.
-- Add more diverse Float16 kernels instead of identity-only kernels.
-- Add edge-case tests for negative Float16 values.
-- Add overflow, underflow, NaN, Inf, and rounding behaviour tests for Float16.
-- Clean up debug `printf` statements in `ConvAccelerator.scala`.
-- Keep only essential STORE / RESP debug messages if needed.
-- Improve performance by allowing multiple outstanding memory requests.
-- Optimize or pipeline the Float16 compute datapath if performance becomes a concern.
-- Prepare FSM, datapath, and memory-flow diagrams for the final report.
-- Update final report and presentation materials.
+The next stage of the project should focus on two areas.
+
+### 1. Find suitable CNN algorithms for this accelerator
+
+The current accelerator is best suited for small convolution workloads with 1x1, 3x3, or 5x5 kernels on a 32x32 input matrix.
+
+The next task is to identify CNN algorithms or layers that match this hardware structure. Good candidates include:
+
+- simple image filtering layers
+- edge detection kernels
+- small CNN convolution layers
+- LeNet-style early convolution layers
+- lightweight 3x3 convolution workloads
+- 1x1 pointwise convolution workloads
+
+The goal is to choose an algorithm that can clearly demonstrate why the custom accelerator is useful.
+
+### 2. Write different tests
+
+The current tests mainly use identity-style kernels. More tests are needed to validate the accelerator more realistically.
+
+Recommended new tests:
+
+- non-identity 3x3 kernel test
+- non-identity 5x5 kernel test
+- negative-value fixed-point test
+- negative-value Float16 test
+- mixed positive and negative kernel test
+- zero-padding boundary test
+- all-zero kernel test
+- all-one kernel test
+- random small-value input and kernel test
+- CPU reference comparison for each test
+- cycle-count comparison for fixed16 and Float16 modes
+
+These tests should be added before final evaluation and report writing.
