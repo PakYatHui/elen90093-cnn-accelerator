@@ -47,6 +47,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val FUNCT_KERNEL  = 4.U(7.W)
 
   // FSM states.
+  // State count is unchanged.
   val sIdle :: sDecode :: sConfig :: sKernel :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
@@ -91,9 +92,18 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val issuedIsInput = RegInit(false.B)
   val issuedIndex   = RegInit(0.U(11.W))
 
-  // Compute bookkeeping.
+  // Compute output pixel bookkeeping.
   val outRow = RegInit(0.U(6.W))
   val outCol = RegInit(0.U(6.W))
+
+  // Sequential MAC bookkeeping.
+  val macKr  = RegInit(0.U(3.W))
+  val macKc  = RegInit(0.U(3.W))
+  val macIdx = RegInit(0.U(6.W))
+
+  // Sequential accumulators.
+  val fixedAcc = RegInit(0.S(40.W))
+  val floatAcc = RegInit(0.U(16.W))
 
   // Helper wires.
   val doConfig  = functReg === FUNCT_CONFIG
@@ -166,13 +176,13 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, add.io.out)
   }
 
-  // Return fixed16 input value for the selected kernel window.
+  // Return fixed16 input value for the selected runtime kernel position.
   // Out-of-range accesses implement zero padding.
-  def getInputAtFixed(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): SInt = {
+  def getInputAtFixed(baseRow: UInt, baseCol: UInt, kr: UInt, kc: UInt): SInt = {
     val radius = kernelSizeReg >> 1
 
-    val rowS = baseRow.zext + kr.S(4.W) - radius.zext
-    val colS = baseCol.zext + kc.S(4.W) - radius.zext
+    val rowS = baseRow.zext + kr.zext - radius.zext
+    val colS = baseCol.zext + kc.zext - radius.zext
 
     val rowValid = rowS >= 0.S && rowS < INPUT_SIZE.S
     val colValid = colS >= 0.S && colS < INPUT_SIZE.S
@@ -184,13 +194,13 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)).asSInt, 0.S(16.W))
   }
 
-  // Return raw float16 bits for the selected kernel window.
+  // Return raw float16 bits for the selected runtime kernel position.
   // Out-of-range accesses return +0.0 half-precision.
-  def getInputAtFloat16(baseRow: UInt, baseCol: UInt, kr: Int, kc: Int): UInt = {
+  def getInputAtFloat16(baseRow: UInt, baseCol: UInt, kr: UInt, kc: UInt): UInt = {
     val radius = kernelSizeReg >> 1
 
-    val rowS = baseRow.zext + kr.S(4.W) - radius.zext
-    val colS = baseCol.zext + kc.S(4.W) - radius.zext
+    val rowS = baseRow.zext + kr.zext - radius.zext
+    val colS = baseCol.zext + kc.zext - radius.zext
 
     val rowValid = rowS >= 0.S && rowS < INPUT_SIZE.S
     val colValid = colS >= 0.S && colS < INPUT_SIZE.S
@@ -202,49 +212,31 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)), 0.U(16.W))
   }
 
-  // Fixed16 MAC tree for one output element.
-  val fixedMacTerms = Wire(Vec(MAX_KERNEL_ELEMS, SInt(32.W)))
-
-  // Float16 MAC tree for one output element.
-  val floatMulTerms = Wire(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
-
-  for (kr <- 0 until MAX_KERNEL_SIZE) {
-    for (kc <- 0 until MAX_KERNEL_SIZE) {
-      val termIdx = kr * MAX_KERNEL_SIZE + kc
-      val active = kr.U < kernelSizeReg && kc.U < kernelSizeReg
-      val kernelIndex = kr.U(3.W) * kernelSizeReg + kc.U(3.W)
-
-      // Fixed16 path.
-      val fixedInVal = getInputAtFixed(outRow, outCol, kr, kc)
-      val fixedKerVal = kernelBuf(kernelIndex(4, 0)).asSInt
-
-      // 8.8 x 8.8 produces 16.16. Shift right by 8 to return to 8.8 scale.
-      fixedMacTerms(termIdx) := Mux(active, (fixedInVal * fixedKerVal) >> 8, 0.S(32.W))
-
-      // Float16 path.
-      val floatInVal = getInputAtFloat16(outRow, outCol, kr, kc)
-      val floatKerVal = kernelBuf(kernelIndex(4, 0))
-      val floatProduct = fp16Mul(floatInVal, floatKerVal)
-
-      floatMulTerms(termIdx) := Mux(active, floatProduct, 0.U(16.W))
-    }
-  }
-
-  val fixedMacSum = fixedMacTerms.reduce(_ + _)
-
-  // Keep the original fixed16 truncation behaviour.
-  val fixedMacOut16 = fixedMacSum.asUInt(15, 0)
-
-  // Sum all float16 products.
-  val floatMacOut16 = floatMulTerms.reduce((a, b) => fp16Add(a, b))
-
-  val computeOut16 = Mux(
-    dataTypeReg === DATA_FLOAT16,
-    floatMacOut16,
-    fixedMacOut16
-  )
-
+  // Current output index.
   val outIndex = (outRow << 5) + outCol
+
+  // Sequential fixed16 MAC datapath.
+  val fixedInVal  = getInputAtFixed(outRow, outCol, macKr, macKc)
+  val fixedKerVal = kernelBuf(macIdx(4, 0)).asSInt
+
+  // 8.8 x 8.8 produces 16.16.
+  // Shift right by 8 to return to 8.8 scale.
+  val fixedTermRaw = (fixedInVal * fixedKerVal) >> 8
+  val fixedTerm = Wire(SInt(40.W))
+  fixedTerm := fixedTermRaw
+
+  val nextFixedAcc = (fixedAcc + fixedTerm).asUInt(39, 0).asSInt
+
+  // Sequential Float16 MAC datapath.
+  val floatInVal   = getInputAtFloat16(outRow, outCol, macKr, macKc)
+  val floatKerVal  = kernelBuf(macIdx(4, 0))
+  val floatTerm    = fp16Mul(floatInVal, floatKerVal)
+  val nextFloatAcc = fp16Add(floatAcc, floatTerm)
+
+  // Kernel and output scanning helpers.
+  val lastMacTerm   = macIdx === (kernelElemsReg - 1.U)
+  val lastKernelCol = macKc === (kernelSizeReg - 1.U)
+  val lastOutPixel  = (outRow === (INPUT_SIZE - 1).U) && (outCol === (INPUT_SIZE - 1).U)
 
   switch(state) {
 
@@ -292,7 +284,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             printf("[MyConvAccel] Decode -> Data inputAddr=%x outputAddr=%x kernelAddr=%x kernelSize=%d dataType=%d biasEnable=%d\n",
               rs1Reg, rs2Reg, kernelAddrReg, kernelSizeReg, dataTypeReg, biasEnableReg)
 
-            // Reuse the existing working load state.
             state := sLoad
           }
 
@@ -306,6 +297,13 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         when(configuredReg && kernelConfiguredReg && loadedReg) {
           outRow := 0.U
           outCol := 0.U
+
+          macKr  := 0.U
+          macKc  := 0.U
+          macIdx := 0.U
+
+          fixedAcc := 0.S
+          floatAcc := 0.U
 
           printf("[MyConvAccel] Decode -> Compute kernelSize=%d dataType=%d biasEnable=%d\n",
             kernelSizeReg, dataTypeReg, biasEnableReg)
@@ -397,7 +395,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
     is(sLoad) {
       // Issue one read at a time: first the 32x32 input, then the active kernel.
-      // Both fixed16 and float16 use 16-bit elements, so the original memory flow is preserved.
+      // Both fixed16 and float16 use 16-bit elements.
       when(!memInflight) {
         when(inputLoadIdx < INPUT_ELEMS.U) {
           io.mem.req.valid := true.B
@@ -454,42 +452,82 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sCompute) {
-      // Compute one output element per cycle.
-      outputBuf(outIndex(9, 0)) := computeOut16
+      // Sequential MAC:
+      // one kernel term is accumulated per cycle.
 
-      val watchComputeIdx =
-        (outIndex < 4.U) ||
-        (outIndex === 416.U) ||
-        (outIndex === 704.U) ||
-        (outIndex === 832.U) ||
-        (outIndex >= 1020.U)
+      when(lastMacTerm) {
+        // Current output pixel finishes in this cycle.
+        val finalFixedOut16 = nextFixedAcc.asUInt(15, 0)
+        val finalFloatOut16 = nextFloatAcc
 
-      when(watchComputeIdx) {
-        printf("[COMPUTE_DBG] idx=%d row=%d col=%d dataType=%d out=%x\n",
-          outIndex,
-          outRow,
-          outCol,
-          dataTypeReg,
-          computeOut16
+        val finalOut16 = Mux(
+          dataTypeReg === DATA_FLOAT16,
+          finalFloatOut16,
+          finalFixedOut16
         )
-      }
 
-      when(outCol === (INPUT_SIZE - 1).U) {
-        outCol := 0.U
+        outputBuf(outIndex(9, 0)) := finalOut16
 
-        when(outRow === (INPUT_SIZE - 1).U) {
+        val watchComputeIdx =
+          (outIndex < 4.U) ||
+          (outIndex === 416.U) ||
+          (outIndex === 704.U) ||
+          (outIndex === 832.U) ||
+          (outIndex >= 1020.U)
+
+        when(watchComputeIdx) {
+          printf("[COMPUTE_DBG] idx=%d row=%d col=%d dataType=%d out=%x macTerms=%d\n",
+            outIndex,
+            outRow,
+            outCol,
+            dataTypeReg,
+            finalOut16,
+            kernelElemsReg
+          )
+        }
+
+        // Reset MAC state for the next output pixel.
+        macKr  := 0.U
+        macKc  := 0.U
+        macIdx := 0.U
+
+        fixedAcc := 0.S
+        floatAcc := 0.U
+
+        when(lastOutPixel) {
           outRow := 0.U
+          outCol := 0.U
+
           computedReg := true.B
           resultReg := RET_SUCCESS
 
           printf("[MyConvAccel] COMPUTE complete\n")
 
           state := sRespond
+
         }.otherwise {
-          outRow := outRow + 1.U
+          when(outCol === (INPUT_SIZE - 1).U) {
+            outCol := 0.U
+            outRow := outRow + 1.U
+          }.otherwise {
+            outCol := outCol + 1.U
+          }
         }
+
       }.otherwise {
-        outCol := outCol + 1.U
+        // Accumulate current term.
+        fixedAcc := nextFixedAcc
+        floatAcc := nextFloatAcc
+
+        // Move to the next kernel term.
+        macIdx := macIdx + 1.U
+
+        when(lastKernelCol) {
+          macKc := 0.U
+          macKr := macKr + 1.U
+        }.otherwise {
+          macKc := macKc + 1.U
+        }
       }
     }
 

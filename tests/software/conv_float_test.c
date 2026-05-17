@@ -291,12 +291,9 @@ static int run_test(const char *name, int kernel_size) {
     // Fill kernel: identity-like kernel.
     memset(kernel_buf, 0, sizeof(kernel_buf));
 
-    if (kernel_size == 1) {
-        kernel_buf[0] = float_to_half_bits(1.0f);
-    } else {
-        int centre = (kernel_size / 2) * kernel_size + (kernel_size / 2);
-        kernel_buf[centre] = float_to_half_bits(1.0f);
-    }
+for (int i = 0; i < kernel_size * kernel_size; i++) {
+    kernel_buf[i] = float_to_half_bits(1.0f);
+}
 
     uint64_t t0, t1;
     uint64_t ret;
