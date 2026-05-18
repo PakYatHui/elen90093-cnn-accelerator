@@ -1,17 +1,8 @@
 // =============================================================================
-// conv_test.c
-// ELEN90093 CNN Convolution Accelerator - Fixed16 Functional Test
-//
-// Tests 1x1, 3x3, and 5x5 convolution by comparing accelerator output
-// against a software reference implementation.
-//
-// Fixed-point format: 8.8 signed
-// All matrices are 32x32 elements of int16_t.
-//
-// Command interface:
-// CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE
-//
-// This version enables real scalar bias support.
+// conv_test_streaming.c
+// Fixed16 test for the streaming/window-based CNN RoCC accelerator.
+// Interface remains CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE.
+// STORE is a compatibility barrier: hardware stores outputs during COMPUTE.
 // =============================================================================
 
 #include <stdio.h>
@@ -19,98 +10,69 @@
 #include <string.h>
 #include "rocc.h"
 
-// =============================================================================
-// Hardware parameters
-// =============================================================================
 #define INPUT_SIZE   32
 #define INPUT_ELEMS  (INPUT_SIZE * INPUT_SIZE)
 
-// funct7 encodings
 #define FUNCT_CONFIG  0
 #define FUNCT_DATA    1
 #define FUNCT_COMPUTE 2
 #define FUNCT_STORE   3
 #define FUNCT_KERNEL  4
 
-// RoCC uses custom0 opcode
 #define ROCC_X 0
 
-// Data type encoding
 #define DATA_FIXED16 0
 #define DATA_FLOAT16 1
 
-// CONFIG rs2 layout:
-// bits [1:0] = data type
-// bit  [2]   = bias enable
 #define CONFIG_FLAGS(data_type, bias_enable) \
     (((uint64_t)(data_type) & 0x3ULL) | ((((uint64_t)(bias_enable)) & 0x1ULL) << 2))
 
-// =============================================================================
-// Fixed-point helpers
-// =============================================================================
-#define TO_FP(x)   ((int16_t)((x) * 256.0))
-#define FROM_FP(x) ((double)(x) / 256.0)
+#define TO_FP(x)    ((int16_t)((x) * 256.0))
+#define FROM_FP(x)  ((double)(x) / 256.0)
 
-// Forward declaration
-static int check_output(const char *test_name);
-
-// =============================================================================
-// RoCC instruction wrappers
-// =============================================================================
-
-// CONFIG:
-// rs1 = kernel_size
-// rs2 = config flags: data type + bias enable
 static inline uint64_t conv_config(uint64_t kernel_size, uint64_t config_flags) {
     uint64_t ret;
-    ROCC_INSTRUCTION_DSS(ROCC_X, ret,
-                         kernel_size, config_flags,
-                         FUNCT_CONFIG);
+    ROCC_INSTRUCTION_DSS(ROCC_X, ret, kernel_size, config_flags, FUNCT_CONFIG);
     return ret;
 }
 
-// KERNEL:
-// rs1 = kernel weight address
-// rs2 = bias address
 static inline uint64_t conv_kernel(void *kernel_addr, void *bias_addr) {
     uint64_t ret;
-    ROCC_INSTRUCTION_DSS(ROCC_X, ret,
-                         (uint64_t)kernel_addr, (uint64_t)bias_addr,
-                         FUNCT_KERNEL);
+    ROCC_INSTRUCTION_DSS(ROCC_X, ret, (uint64_t)kernel_addr, (uint64_t)bias_addr, FUNCT_KERNEL);
     return ret;
 }
 
-// DATA:
-// rs1 = input data address
-// rs2 = output data address
 static inline uint64_t conv_data(void *input_addr, void *output_addr) {
     uint64_t ret;
-    ROCC_INSTRUCTION_DSS(ROCC_X, ret,
-                         (uint64_t)input_addr, (uint64_t)output_addr,
-                         FUNCT_DATA);
+    ROCC_INSTRUCTION_DSS(ROCC_X, ret, (uint64_t)input_addr, (uint64_t)output_addr, FUNCT_DATA);
     return ret;
 }
 
-// COMPUTE:
-// no operands
 static inline uint64_t conv_compute(void) {
     uint64_t ret;
     ROCC_INSTRUCTION_D(ROCC_X, ret, FUNCT_COMPUTE);
     return ret;
 }
 
-// STORE:
-// no operands
 static inline uint64_t conv_store(void) {
     uint64_t ret;
     ROCC_INSTRUCTION_D(ROCC_X, ret, FUNCT_STORE);
     return ret;
 }
 
-// =============================================================================
-// Software golden reference
-// =============================================================================
-static void sw_conv(
+static inline uint64_t read_cycle(void) {
+    uint64_t cycle;
+    asm volatile ("rdcycle %0" : "=r"(cycle));
+    return cycle;
+}
+
+static int16_t input_buf [INPUT_ELEMS] __attribute__((aligned(64)));
+static int16_t kernel_buf[5 * 5]       __attribute__((aligned(64)));
+static int16_t bias_buf  [4]           __attribute__((aligned(64)));
+static int16_t hw_output [INPUT_ELEMS] __attribute__((aligned(64)));
+static int16_t sw_output [INPUT_ELEMS] __attribute__((aligned(64)));
+
+static void sw_conv_fixed16(
     const int16_t *input,
     const int16_t *kernel,
     const int16_t *bias,
@@ -136,145 +98,21 @@ static void sw_conv(
                     }
 
                     int16_t ker_val = kernel[kr * kernel_size + kc];
-
-                    // 8.8 x 8.8 produces 16.16.
-                    // Shift right by 8 to return to 8.8 scale.
                     sum += ((int32_t)in_val * (int32_t)ker_val) >> 8;
                 }
             }
 
-            // Bias is also 8.8 fixed-point, so it is added after MAC scaling.
             if (bias_enable) {
                 sum += (int32_t)bias[0];
             }
 
-            // Match the hardware truncation behaviour.
             output[row * INPUT_SIZE + col] = (int16_t)(sum & 0xFFFF);
         }
     }
 }
 
-// =============================================================================
-// Test data buffers
-// =============================================================================
-static int16_t input_buf [INPUT_ELEMS] __attribute__((aligned(64)));
-static int16_t kernel_buf[5 * 5]       __attribute__((aligned(64)));
-static int16_t bias_buf  [4]           __attribute__((aligned(64)));
-static int16_t hw_output [INPUT_ELEMS] __attribute__((aligned(64)));
-static int16_t sw_output [INPUT_ELEMS] __attribute__((aligned(64)));
-
-static inline uint64_t read_cycle(void) {
-    uint64_t cycle;
-    asm volatile ("rdcycle %0" : "=r"(cycle));
-    return cycle;
-}
-
-// =============================================================================
-// Run one complete test
-// =============================================================================
-static int run_test(const char *name, int kernel_size, int bias_enable) {
-    memset(hw_output, 0, sizeof(hw_output));
-    memset(sw_output, 0, sizeof(sw_output));
-    memset(bias_buf, 0, sizeof(bias_buf));
-
-    printf("\n=== %s (kernel=%dx%d, bias=%s) ===\n",
-           name, kernel_size, kernel_size, bias_enable ? "on" : "off");
-
-    // Fill input: value at (row, col) = row + col.
-    for (int row = 0; row < INPUT_SIZE; row++) {
-        for (int col = 0; col < INPUT_SIZE; col++) {
-            input_buf[row * INPUT_SIZE + col] = TO_FP(row + col);
-        }
-    }
-
-    // Fill kernel: identity-like kernel.
-    memset(kernel_buf, 0, sizeof(kernel_buf));
-
-    if (kernel_size == 1) {
-        kernel_buf[0] = TO_FP(1.0);
-    } else {
-        int centre = (kernel_size / 2) * kernel_size + (kernel_size / 2);
-        kernel_buf[centre] = TO_FP(1.0);
-    }
-
-    // Scalar bias: one 16-bit 8.8 value added to every output pixel.
-    bias_buf[0] = TO_FP(1.5);
-
-    uint64_t t0, t1;
-    uint64_t ret;
-
-    // Ensure CPU writes to input/kernel/bias/output buffers are visible.
-    asm volatile("fence rw, rw" ::: "memory");
-
-    t0 = read_cycle();
-
-    // CONFIG: fixed16, optional scalar bias.
-    ret = conv_config((uint64_t)kernel_size,
-                      CONFIG_FLAGS(DATA_FIXED16, bias_enable));
-    if (!ret) {
-        printf("[%s] CONFIG failed\n", name);
-        return 0;
-    }
-
-    asm volatile("fence rw, rw" ::: "memory");
-
-    // KERNEL: kernel address + bias address.
-    ret = conv_kernel(kernel_buf, bias_enable ? bias_buf : (void *)0);
-    if (!ret) {
-        printf("[%s] KERNEL failed\n", name);
-        return 0;
-    }
-
-    asm volatile("fence rw, rw" ::: "memory");
-
-    // DATA: input address + output address.
-    ret = conv_data(input_buf, hw_output);
-    if (!ret) {
-        printf("[%s] DATA failed\n", name);
-        return 0;
-    }
-
-    ret = conv_compute();
-    if (!ret) {
-        printf("[%s] COMPUTE failed\n", name);
-        return 0;
-    }
-
-    ret = conv_store();
-    if (!ret) {
-        printf("[%s] STORE failed\n", name);
-        return 0;
-    }
-
-    t1 = read_cycle();
-
-    uint64_t hw_cycles = t1 - t0;
-
-    // Ensure CPU sees accelerator memory writes.
-    asm volatile("fence rw, rw" ::: "memory");
-
-    // Software reference.
-    t0 = read_cycle();
-    sw_conv(input_buf, kernel_buf, bias_buf, sw_output, kernel_size, bias_enable);
-    t1 = read_cycle();
-
-    uint64_t sw_cycles = t1 - t0;
-
-    printf("  HW cycles: %lu\n", (unsigned long)hw_cycles);
-    printf("  SW cycles: %lu\n", (unsigned long)sw_cycles);
-
-    if (hw_cycles > 0) {
-        printf("  Speedup:   %lu x\n", (unsigned long)(sw_cycles / hw_cycles));
-    }
-
-    return check_output(name);
-}
-
-// =============================================================================
-// Compare hardware and software output
-// =============================================================================
-static int check_output(const char *test_name) {
-    printf("[%s] First 8 outputs:\n", test_name);
+static int check_output(const char *name) {
+    printf("[%s] First 9 outputs:\n", name);
     printf("  idx | sw_output        | hw_output\n");
 
     for (int i = 0; i < 9; i++) {
@@ -284,42 +122,108 @@ static int check_output(const char *test_name) {
                (uint16_t)hw_output[i], FROM_FP(hw_output[i]));
     }
 
-    int pass = 1;
-
     for (int i = 0; i < INPUT_ELEMS; i++) {
         if (hw_output[i] != sw_output[i]) {
             printf("[%s] MISMATCH at [%d][%d]: hw=0x%04x (%.4f) sw=0x%04x (%.4f)\n",
-                   test_name,
-                   i / INPUT_SIZE,
-                   i % INPUT_SIZE,
+                   name, i / INPUT_SIZE, i % INPUT_SIZE,
                    (uint16_t)hw_output[i], FROM_FP(hw_output[i]),
                    (uint16_t)sw_output[i], FROM_FP(sw_output[i]));
-
-            pass = 0;
-            break;
+            return 0;
         }
     }
 
-    if (pass) {
-        printf("[%s] PASS - all %d outputs match\n", test_name, INPUT_ELEMS);
-    }
-
-    return pass;
+    printf("[%s] PASS - all %d outputs match\n", name, INPUT_ELEMS);
+    return 1;
 }
 
-// =============================================================================
-// Main
-// =============================================================================
+static int run_test(const char *name, int kernel_size, int bias_enable) {
+    memset(hw_output, 0, sizeof(hw_output));
+    memset(sw_output, 0, sizeof(sw_output));
+    memset(kernel_buf, 0, sizeof(kernel_buf));
+    memset(bias_buf, 0, sizeof(bias_buf));
+
+    printf("\n=== %s kernel=%dx%d bias=%s ===\n",
+           name, kernel_size, kernel_size, bias_enable ? "on" : "off");
+
+    for (int row = 0; row < INPUT_SIZE; row++) {
+        for (int col = 0; col < INPUT_SIZE; col++) {
+            input_buf[row * INPUT_SIZE + col] = TO_FP(row + col);
+        }
+    }
+
+    if (kernel_size == 1) {
+        kernel_buf[0] = TO_FP(1.0);
+    } else {
+        int centre = (kernel_size / 2) * kernel_size + (kernel_size / 2);
+        kernel_buf[centre] = TO_FP(1.0);
+    }
+
+    bias_buf[0] = TO_FP(1.5);
+
+    asm volatile("fence rw, rw" ::: "memory");
+
+    uint64_t t0 = read_cycle();
+
+    if (!conv_config((uint64_t)kernel_size, CONFIG_FLAGS(DATA_FIXED16, bias_enable))) {
+        printf("[%s] CONFIG failed\n", name);
+        return 0;
+    }
+
+    asm volatile("fence rw, rw" ::: "memory");
+
+    if (!conv_kernel(kernel_buf, bias_enable ? bias_buf : (void *)0)) {
+        printf("[%s] KERNEL failed\n", name);
+        return 0;
+    }
+
+    asm volatile("fence rw, rw" ::: "memory");
+
+    if (!conv_data(input_buf, hw_output)) {
+        printf("[%s] DATA failed\n", name);
+        return 0;
+    }
+
+    if (!conv_compute()) {
+        printf("[%s] COMPUTE failed\n", name);
+        return 0;
+    }
+
+    if (!conv_store()) {
+        printf("[%s] STORE barrier failed\n", name);
+        return 0;
+    }
+
+    uint64_t t1 = read_cycle();
+    uint64_t hw_cycles = t1 - t0;
+
+    asm volatile("fence rw, rw" ::: "memory");
+
+    t0 = read_cycle();
+    sw_conv_fixed16(input_buf, kernel_buf, bias_buf, sw_output, kernel_size, bias_enable);
+    t1 = read_cycle();
+    uint64_t sw_cycles = t1 - t0;
+
+    printf("  HW cycles: %lu\n", (unsigned long)hw_cycles);
+    printf("  SW cycles: %lu\n", (unsigned long)sw_cycles);
+    if (hw_cycles > 0) {
+        printf("  Speedup:   %lu x\n", (unsigned long)(sw_cycles / hw_cycles));
+    }
+
+    return check_output(name);
+}
+
 int main(void) {
-    printf("=== ELEN90093 Convolution Accelerator Fixed16 Bias Test ===\n");
+    printf("=== ELEN90093 Streaming CNN RoCC Accelerator Fixed16 Test ===\n");
 
     int all_pass = 1;
 
-    all_pass &= run_test("Fixed16_Test1_1x1_Bias", 1, 1);
-    all_pass &= run_test("Fixed16_Test2_3x3_Bias", 3, 1);
-    all_pass &= run_test("Fixed16_Test3_5x5_Bias", 5, 1);
+    all_pass &= run_test("Fixed16_1x1_NoBias", 1, 0);
+    all_pass &= run_test("Fixed16_3x3_NoBias", 3, 0);
+    all_pass &= run_test("Fixed16_5x5_NoBias", 5, 0);
+    all_pass &= run_test("Fixed16_1x1_Bias", 1, 1);
+    all_pass &= run_test("Fixed16_3x3_Bias", 3, 1);
+    all_pass &= run_test("Fixed16_5x5_Bias", 5, 1);
 
     printf("\n=== Final Result: %s ===\n", all_pass ? "ALL PASS" : "SOME FAILED");
-
-    return 0;
+    return all_pass ? 0 : 1;
 }

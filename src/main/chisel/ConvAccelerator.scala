@@ -10,7 +10,7 @@ import freechips.rocketchip.rocket._
 import hardfloat._
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel streaming sliding-pipo version")
+  println("DEBUG: Elaborating MyConvAccel streaming sliding-pipo row-parallel version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -179,7 +179,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val computeOutIdx   = RegInit(0.U(10.W))
   val computeRow      = RegInit(0.U(5.W))
   val computeCol      = RegInit(0.U(5.W))
-  val computeMacIdx   = RegInit(0.U(6.W))
+  // Row-parallel MAC counter. One cycle consumes one kernel row.
+  // 1x1 needs 1 cycle/output, 3x3 needs 3 cycles/output, 5x5 needs 5 cycles/output.
+  val computeMacRow   = RegInit(0.U(3.W))
   val computedOutCnt  = RegInit(0.U(11.W))
 
   val fixedAcc = RegInit(0.S(40.W))
@@ -284,28 +286,61 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   }
 
   // ---------------------------------------------------------------------------
-  // Compute datapath wires
+  // Row-parallel compute datapath wires
   // ---------------------------------------------------------------------------
-  val computeInputVal  = windowBuf(computeBufId)(computeMacIdx(4, 0))
-  val computeKernelVal = kernelBuf(computeMacIdx(4, 0))
+  // The previous streaming version used one MAC term per cycle. That made the
+  // lower bound for 5x5 equal to 1024 * 25 = 25600 cycles. This version uses up
+  // to five lanes and consumes one complete kernel row per cycle:
+  //   1x1 -> 1 cycle/output
+  //   3x3 -> 3 cycles/output
+  //   5x5 -> 5 cycles/output
+  // The lane order is left-to-right within a row, preserving the same FP16
+  // accumulation order as the software reference when it accumulates kr/kc.
+  val laneActive = Wire(Vec(5, Bool()))
+  val laneInput  = Wire(Vec(5, UInt(16.W)))
+  val laneKernel = Wire(Vec(5, UInt(16.W)))
 
-  // Fixed16: 8.8 x 8.8 -> 16.16, then >> 8 back to 8.8.
-  val fixedTermRaw = (computeInputVal.asSInt * computeKernelVal.asSInt) >> 8
-  val fixedTerm = Wire(SInt(40.W))
-  fixedTerm := fixedTermRaw
-  val nextFixedAcc = (fixedAcc + fixedTerm).asUInt(39, 0).asSInt
+  for (i <- 0 until 5) {
+    laneActive(i) := i.U < kernelSizeReg
+    val laneIdx = (computeMacRow * kernelSizeReg) + i.U
+    laneInput(i)  := Mux(laneActive(i), windowBuf(computeBufId)(laneIdx(4, 0)), 0.U(16.W))
+    laneKernel(i) := Mux(laneActive(i), kernelBuf(laneIdx(4, 0)), 0.U(16.W))
+  }
+
+  // Fixed16: five parallel 8.8 MAC lanes, then one row-sum is accumulated.
+  val fixedLaneTerms = Wire(Vec(5, SInt(40.W)))
+  for (i <- 0 until 5) {
+    val raw = (laneInput(i).asSInt * laneKernel(i).asSInt) >> 8
+    fixedLaneTerms(i) := Mux(laneActive(i), raw.asSInt, 0.S(40.W))
+  }
+  val fixedRowSum01 = (fixedLaneTerms(0) + fixedLaneTerms(1)).asUInt(39, 0).asSInt
+  val fixedRowSum23 = (fixedLaneTerms(2) + fixedLaneTerms(3)).asUInt(39, 0).asSInt
+  val fixedRowSum04 = (fixedRowSum01 + fixedRowSum23 + fixedLaneTerms(4)).asUInt(39, 0).asSInt
+  val nextFixedAccRow = (fixedAcc + fixedRowSum04).asUInt(39, 0).asSInt
+
   val fixedBiasTerm = Wire(SInt(40.W))
   fixedBiasTerm := Mux(biasEnableReg, biasBuf.asSInt, 0.S(16.W))
-  val finalFixedAcc = (nextFixedAcc + fixedBiasTerm).asUInt(39, 0).asSInt
+  val finalFixedAcc = (nextFixedAccRow + fixedBiasTerm).asUInt(39, 0).asSInt
   val finalFixedOut = finalFixedAcc.asUInt(15, 0)
 
-  // Float16: HardFloat multiply then HardFloat add.
-  val floatTerm = fp16Mul(computeInputVal, computeKernelVal)
-  val nextFloatAcc = fp16Add(floatAcc, floatTerm)
-  val finalFloatOut = Mux(biasEnableReg, fp16Add(nextFloatAcc, biasBuf), nextFloatAcc)
+  // Float16: five parallel multipliers followed by a left-to-right add chain.
+  // The add chain gives the same rounding order as scalar sequential kc order.
+  val floatZero = 0.U(16.W)
+  val floatProducts = Wire(Vec(5, UInt(16.W)))
+  for (i <- 0 until 5) {
+    val p = fp16Mul(laneInput(i), laneKernel(i))
+    floatProducts(i) := Mux(laneActive(i), p, floatZero)
+  }
+  val floatAcc0 = fp16Add(floatAcc, floatProducts(0))
+  val floatAcc1 = Mux(kernelSizeReg > 1.U, fp16Add(floatAcc0, floatProducts(1)), floatAcc0)
+  val floatAcc2 = Mux(kernelSizeReg > 2.U, fp16Add(floatAcc1, floatProducts(2)), floatAcc1)
+  val floatAcc3 = Mux(kernelSizeReg > 3.U, fp16Add(floatAcc2, floatProducts(3)), floatAcc2)
+  val nextFloatAccRow = Mux(kernelSizeReg > 4.U, fp16Add(floatAcc3, floatProducts(4)), floatAcc3)
+
+  val finalFloatOut = Mux(biasEnableReg, fp16Add(nextFloatAccRow, biasBuf), nextFloatAccRow)
 
   val finalOut16 = Mux(dataTypeReg === DATA_FLOAT16, finalFloatOut, finalFixedOut)
-  val lastMacTerm = computeMacIdx === (kernelElemsReg - 1.U)
+  val lastMacRow = computeMacRow === (kernelSizeReg - 1.U)
 
   // ---------------------------------------------------------------------------
   // Window-load address generation wires
@@ -427,7 +462,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           loadSlideMode := false.B
           reuseValid := false.B
           computeActive := false.B
-          computeMacIdx := 0.U
+          computeMacRow := 0.U
           computedOutCnt := 0.U
           fixedAcc := 0.S
           floatAcc := 0.U
@@ -697,7 +732,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           computeOutIdx := windowReadyQ.io.deq.bits.outIdx
           computeRow := windowReadyQ.io.deq.bits.row
           computeCol := windowReadyQ.io.deq.bits.col
-          computeMacIdx := 0.U
+          computeMacRow := 0.U
           fixedAcc := 0.S
           floatAcc := 0.U
           bufState(windowReadyQ.io.deq.bits.bufId) := BUF_COMPUTING
@@ -705,10 +740,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       }
 
       // -----------------------------------------------------------------------
-      // 5. Sequential MAC compute: one kernel term per cycle.
+      // 5. Row-parallel MAC compute: one kernel row per cycle.
       // -----------------------------------------------------------------------
       when(computeActive && !pendingPackValid) {
-        when(lastMacTerm) {
+        when(lastMacRow) {
           // Current output pixel finishes this cycle.
           val completedOut = finalOut16
 
@@ -746,15 +781,15 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
           bufState(computeBufId) := BUF_FREE
           computeActive := false.B
-          computeMacIdx := 0.U
+          computeMacRow := 0.U
           fixedAcc := 0.S
           floatAcc := 0.U
           computedOutCnt := computedOutCnt + 1.U
 
         }.otherwise {
-          fixedAcc := nextFixedAcc
-          floatAcc := nextFloatAcc
-          computeMacIdx := computeMacIdx + 1.U
+          fixedAcc := nextFixedAccRow
+          floatAcc := nextFloatAccRow
+          computeMacRow := computeMacRow + 1.U
         }
       }
 
