@@ -35,6 +35,11 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val DATA_FIXED16 = 0.U(2.W)
   val DATA_FLOAT16 = 1.U(2.W)
 
+  // Load response type encoding.
+  val LOAD_INPUT  = 0.U(2.W)
+  val LOAD_KERNEL = 1.U(2.W)
+  val LOAD_BIAS   = 2.U(2.W)
+
   // Float16 parameters for HardFloat.
   val FP16_EXP_WIDTH = 5
   val FP16_SIG_WIDTH = 11
@@ -47,7 +52,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val FUNCT_KERNEL  = 4.U(7.W)
 
   // FSM states.
-  // State count is unchanged.
   val sIdle :: sDecode :: sConfig :: sKernel :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
@@ -83,14 +87,19 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val inputBuf  = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
   val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
   val outputBuf = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
+  val biasBuf   = RegInit(0.U(16.W))
 
   // Load/store bookkeeping.
+  // inputLoadIdx and storeIdx are element indices.
+  // The input loader advances by 4 elements because it uses 64-bit loads.
   val inputLoadIdx  = RegInit(0.U(11.W))
   val kernelLoadIdx = RegInit(0.U(6.W))
   val storeIdx      = RegInit(0.U(11.W))
   val memInflight   = RegInit(false.B)
-  val issuedIsInput = RegInit(false.B)
+  val issuedLoadType = RegInit(LOAD_INPUT)
   val issuedIndex   = RegInit(0.U(11.W))
+  val issuedWide    = RegInit(false.B)
+  val biasLoaded    = RegInit(true.B)
 
   // Compute output pixel bookkeeping.
   val outRow = RegInit(0.U(6.W))
@@ -227,11 +236,17 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   val nextFixedAcc = (fixedAcc + fixedTerm).asUInt(39, 0).asSInt
 
+  // Fixed16 bias is stored in the same 8.8 format as input/kernel/output.
+  val fixedBiasTerm = Wire(SInt(40.W))
+  fixedBiasTerm := Mux(biasEnableReg, biasBuf.asSInt, 0.S(16.W))
+  val finalFixedAccWithBias = (nextFixedAcc + fixedBiasTerm).asUInt(39, 0).asSInt
+
   // Sequential Float16 MAC datapath.
   val floatInVal   = getInputAtFloat16(outRow, outCol, macKr, macKc)
   val floatKerVal  = kernelBuf(macIdx(4, 0))
   val floatTerm    = fp16Mul(floatInVal, floatKerVal)
   val nextFloatAcc = fp16Add(floatAcc, floatTerm)
+  val finalFloatAccWithBias = Mux(biasEnableReg, fp16Add(nextFloatAcc, biasBuf), nextFloatAcc)
 
   // Kernel and output scanning helpers.
   val lastMacTerm   = macIdx === (kernelElemsReg - 1.U)
@@ -269,23 +284,17 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
       }.elsewhen(doData) {
         when(configuredReg && kernelConfiguredReg) {
-          when(biasEnableReg) {
-            resultReg := RET_ERROR
-            printf("[MyConvAccel] DATA rejected: bias datapath is not implemented yet\n")
-            state := sRespond
+          inputAddrReg  := rs1Reg
+          outputAddrReg := rs2Reg
+          inputLoadIdx  := 0.U
+          kernelLoadIdx := 0.U
+          biasLoaded    := !biasEnableReg
+          memInflight   := false.B
 
-          }.otherwise {
-            inputAddrReg  := rs1Reg
-            outputAddrReg := rs2Reg
-            inputLoadIdx  := 0.U
-            kernelLoadIdx := 0.U
-            memInflight   := false.B
+          printf("[MyConvAccel] Decode -> Data inputAddr=%x outputAddr=%x kernelAddr=%x biasAddr=%x kernelSize=%d dataType=%d biasEnable=%d\n",
+            rs1Reg, rs2Reg, kernelAddrReg, biasAddrReg, kernelSizeReg, dataTypeReg, biasEnableReg)
 
-            printf("[MyConvAccel] Decode -> Data inputAddr=%x outputAddr=%x kernelAddr=%x kernelSize=%d dataType=%d biasEnable=%d\n",
-              rs1Reg, rs2Reg, kernelAddrReg, kernelSizeReg, dataTypeReg, biasEnableReg)
-
-            state := sLoad
-          }
+          state := sLoad
 
         }.otherwise {
           resultReg := RET_ERROR
@@ -305,8 +314,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           fixedAcc := 0.S
           floatAcc := 0.U
 
-          printf("[MyConvAccel] Decode -> Compute kernelSize=%d dataType=%d biasEnable=%d\n",
-            kernelSizeReg, dataTypeReg, biasEnableReg)
+          printf("[MyConvAccel] Decode -> Compute kernelSize=%d dataType=%d biasEnable=%d bias=%x\n",
+            kernelSizeReg, dataTypeReg, biasEnableReg, biasBuf)
 
           state := sCompute
         }.otherwise {
@@ -369,6 +378,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         kernelElemsReg := 0.U
         dataTypeReg := DATA_FIXED16
         biasEnableReg := false.B
+        biasBuf := 0.U
         resultReg := RET_ERROR
 
         printf("[MyConvAccel] CONFIG error kernelSize=%d dataType=%d\n",
@@ -394,35 +404,54 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sLoad) {
-      // Issue one read at a time: first the 32x32 input, then the active kernel.
-      // Both fixed16 and float16 use 16-bit elements.
+      // Blocking load is preserved for low risk, but input and most kernel reads
+      // now use 64-bit memory loads to fetch four 16-bit elements per request.
       when(!memInflight) {
         when(inputLoadIdx < INPUT_ELEMS.U) {
           io.mem.req.valid := true.B
           io.mem.req.bits.addr := inputAddrReg + (inputLoadIdx << 1)
           io.mem.req.bits.tag := 0.U
           io.mem.req.bits.cmd := M_XRD
-          io.mem.req.bits.size := 1.U
+          io.mem.req.bits.size := 3.U
           io.mem.req.bits.signed := true.B
 
           when(io.mem.req.fire) {
             memInflight := true.B
-            issuedIsInput := true.B
+            issuedLoadType := LOAD_INPUT
             issuedIndex := inputLoadIdx
+            issuedWide := true.B
           }
 
         }.elsewhen(kernelLoadIdx < kernelElemsReg) {
+          val kernelWideLoad = (kernelLoadIdx + 3.U) < kernelElemsReg
+
           io.mem.req.valid := true.B
           io.mem.req.bits.addr := kernelAddrReg + (kernelLoadIdx << 1)
           io.mem.req.bits.tag := 1.U
+          io.mem.req.bits.cmd := M_XRD
+          io.mem.req.bits.size := Mux(kernelWideLoad, 3.U, 1.U)
+          io.mem.req.bits.signed := true.B
+
+          when(io.mem.req.fire) {
+            memInflight := true.B
+            issuedLoadType := LOAD_KERNEL
+            issuedIndex := kernelLoadIdx
+            issuedWide := kernelWideLoad
+          }
+
+        }.elsewhen(biasEnableReg && !biasLoaded) {
+          io.mem.req.valid := true.B
+          io.mem.req.bits.addr := biasAddrReg
+          io.mem.req.bits.tag := 2.U
           io.mem.req.bits.cmd := M_XRD
           io.mem.req.bits.size := 1.U
           io.mem.req.bits.signed := true.B
 
           when(io.mem.req.fire) {
             memInflight := true.B
-            issuedIsInput := false.B
-            issuedIndex := kernelLoadIdx
+            issuedLoadType := LOAD_BIAS
+            issuedIndex := 0.U
+            issuedWide := false.B
           }
 
         }.otherwise {
@@ -430,21 +459,37 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           computedReg := false.B
           resultReg := RET_SUCCESS
 
-          printf("[MyConvAccel] DATA/LOAD complete\n")
+          printf("[MyConvAccel] DATA/LOAD complete bias=%x\n", biasBuf)
 
           state := sRespond
         }
       }
 
       when(io.mem.resp.valid) {
-        val loadedData = io.mem.resp.bits.data(15, 0)
+        val loadedData = io.mem.resp.bits.data
 
-        when(issuedIsInput) {
-          inputBuf(issuedIndex(9, 0)) := loadedData
-          inputLoadIdx := inputLoadIdx + 1.U
-        }.otherwise {
-          kernelBuf(issuedIndex(4, 0)) := loadedData
-          kernelLoadIdx := kernelLoadIdx + 1.U
+        when(issuedLoadType === LOAD_INPUT) {
+          inputBuf(issuedIndex(9, 0)) := loadedData(15, 0)
+          inputBuf((issuedIndex + 1.U)(9, 0)) := loadedData(31, 16)
+          inputBuf((issuedIndex + 2.U)(9, 0)) := loadedData(47, 32)
+          inputBuf((issuedIndex + 3.U)(9, 0)) := loadedData(63, 48)
+          inputLoadIdx := inputLoadIdx + 4.U
+
+        }.elsewhen(issuedLoadType === LOAD_KERNEL) {
+          kernelBuf(issuedIndex(4, 0)) := loadedData(15, 0)
+
+          when(issuedWide) {
+            kernelBuf((issuedIndex + 1.U)(4, 0)) := loadedData(31, 16)
+            kernelBuf((issuedIndex + 2.U)(4, 0)) := loadedData(47, 32)
+            kernelBuf((issuedIndex + 3.U)(4, 0)) := loadedData(63, 48)
+            kernelLoadIdx := issuedIndex(5, 0) + 4.U
+          }.otherwise {
+            kernelLoadIdx := issuedIndex(5, 0) + 1.U
+          }
+
+        }.elsewhen(issuedLoadType === LOAD_BIAS) {
+          biasBuf := loadedData(15, 0)
+          biasLoaded := true.B
         }
 
         memInflight := false.B
@@ -457,8 +502,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
       when(lastMacTerm) {
         // Current output pixel finishes in this cycle.
-        val finalFixedOut16 = nextFixedAcc.asUInt(15, 0)
-        val finalFloatOut16 = nextFloatAcc
+        val finalFixedOut16 = finalFixedAccWithBias.asUInt(15, 0)
+        val finalFloatOut16 = finalFloatAccWithBias
 
         val finalOut16 = Mux(
           dataTypeReg === DATA_FLOAT16,
@@ -476,11 +521,13 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           (outIndex >= 1020.U)
 
         when(watchComputeIdx) {
-          printf("[COMPUTE_DBG] idx=%d row=%d col=%d dataType=%d out=%x macTerms=%d\n",
+          printf("[COMPUTE_DBG] idx=%d row=%d col=%d dataType=%d biasEnable=%d bias=%x out=%x macTerms=%d\n",
             outIndex,
             outRow,
             outCol,
             dataTypeReg,
+            biasEnableReg,
+            biasBuf,
             finalOut16,
             kernelElemsReg
           )

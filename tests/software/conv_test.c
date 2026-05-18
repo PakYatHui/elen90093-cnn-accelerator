@@ -1,6 +1,6 @@
 // =============================================================================
 // conv_test.c
-// ELEN90093 CNN Convolution Accelerator - Functional Test
+// ELEN90093 CNN Convolution Accelerator - Fixed16 Functional Test
 //
 // Tests 1x1, 3x3, and 5x5 convolution by comparing accelerator output
 // against a software reference implementation.
@@ -8,8 +8,10 @@
 // Fixed-point format: 8.8 signed
 // All matrices are 32x32 elements of int16_t.
 //
-// Minimal update for new command interface:
+// Command interface:
 // CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE
+//
+// This version enables real scalar bias support.
 // =============================================================================
 
 #include <stdio.h>
@@ -35,7 +37,7 @@
 
 // Data type encoding
 #define DATA_FIXED16 0
-#define DATA_FLOAT32 1
+#define DATA_FLOAT16 1
 
 // CONFIG rs2 layout:
 // bits [1:0] = data type
@@ -81,7 +83,6 @@ static inline uint64_t conv_kernel(void *kernel_addr, void *bias_addr) {
 // DATA:
 // rs1 = input data address
 // rs2 = output data address
-// This replaces the old LOAD command at software-interface level.
 static inline uint64_t conv_data(void *input_addr, void *output_addr) {
     uint64_t ret;
     ROCC_INSTRUCTION_DSS(ROCC_X, ret,
@@ -112,8 +113,10 @@ static inline uint64_t conv_store(void) {
 static void sw_conv(
     const int16_t *input,
     const int16_t *kernel,
+    const int16_t *bias,
     int16_t       *output,
-    int            kernel_size)
+    int            kernel_size,
+    int            bias_enable)
 {
     int radius = kernel_size / 2;
 
@@ -140,6 +143,11 @@ static void sw_conv(
                 }
             }
 
+            // Bias is also 8.8 fixed-point, so it is added after MAC scaling.
+            if (bias_enable) {
+                sum += (int32_t)bias[0];
+            }
+
             // Match the hardware truncation behaviour.
             output[row * INPUT_SIZE + col] = (int16_t)(sum & 0xFFFF);
         }
@@ -151,6 +159,7 @@ static void sw_conv(
 // =============================================================================
 static int16_t input_buf [INPUT_ELEMS] __attribute__((aligned(64)));
 static int16_t kernel_buf[5 * 5]       __attribute__((aligned(64)));
+static int16_t bias_buf  [4]           __attribute__((aligned(64)));
 static int16_t hw_output [INPUT_ELEMS] __attribute__((aligned(64)));
 static int16_t sw_output [INPUT_ELEMS] __attribute__((aligned(64)));
 
@@ -163,11 +172,13 @@ static inline uint64_t read_cycle(void) {
 // =============================================================================
 // Run one complete test
 // =============================================================================
-static int run_test(const char *name, int kernel_size) {
+static int run_test(const char *name, int kernel_size, int bias_enable) {
     memset(hw_output, 0, sizeof(hw_output));
     memset(sw_output, 0, sizeof(sw_output));
+    memset(bias_buf, 0, sizeof(bias_buf));
 
-    printf("\n=== %s (kernel=%dx%d) ===\n", name, kernel_size, kernel_size);
+    printf("\n=== %s (kernel=%dx%d, bias=%s) ===\n",
+           name, kernel_size, kernel_size, bias_enable ? "on" : "off");
 
     // Fill input: value at (row, col) = row + col.
     for (int row = 0; row < INPUT_SIZE; row++) {
@@ -186,17 +197,20 @@ static int run_test(const char *name, int kernel_size) {
         kernel_buf[centre] = TO_FP(1.0);
     }
 
+    // Scalar bias: one 16-bit 8.8 value added to every output pixel.
+    bias_buf[0] = TO_FP(1.5);
+
     uint64_t t0, t1;
     uint64_t ret;
 
-    // Ensure CPU writes to input/kernel/output buffers are visible.
+    // Ensure CPU writes to input/kernel/bias/output buffers are visible.
     asm volatile("fence rw, rw" ::: "memory");
 
     t0 = read_cycle();
 
-    // CONFIG: fixed16, no bias.
+    // CONFIG: fixed16, optional scalar bias.
     ret = conv_config((uint64_t)kernel_size,
-                      CONFIG_FLAGS(DATA_FIXED16, 0));
+                      CONFIG_FLAGS(DATA_FIXED16, bias_enable));
     if (!ret) {
         printf("[%s] CONFIG failed\n", name);
         return 0;
@@ -205,8 +219,7 @@ static int run_test(const char *name, int kernel_size) {
     asm volatile("fence rw, rw" ::: "memory");
 
     // KERNEL: kernel address + bias address.
-    // Bias is disabled, so bias address is zero.
-    ret = conv_kernel(kernel_buf, (void *)0);
+    ret = conv_kernel(kernel_buf, bias_enable ? bias_buf : (void *)0);
     if (!ret) {
         printf("[%s] KERNEL failed\n", name);
         return 0;
@@ -215,7 +228,6 @@ static int run_test(const char *name, int kernel_size) {
     asm volatile("fence rw, rw" ::: "memory");
 
     // DATA: input address + output address.
-    // Internally this should trigger the existing sLoad logic.
     ret = conv_data(input_buf, hw_output);
     if (!ret) {
         printf("[%s] DATA failed\n", name);
@@ -243,7 +255,7 @@ static int run_test(const char *name, int kernel_size) {
 
     // Software reference.
     t0 = read_cycle();
-    sw_conv(input_buf, kernel_buf, sw_output, kernel_size);
+    sw_conv(input_buf, kernel_buf, bias_buf, sw_output, kernel_size, bias_enable);
     t1 = read_cycle();
 
     uint64_t sw_cycles = t1 - t0;
@@ -299,13 +311,13 @@ static int check_output(const char *test_name) {
 // Main
 // =============================================================================
 int main(void) {
-    printf("=== ELEN90093 Convolution Accelerator Test ===\n");
+    printf("=== ELEN90093 Convolution Accelerator Fixed16 Bias Test ===\n");
 
     int all_pass = 1;
 
-    all_pass &= run_test("Test1_1x1", 1);
-    all_pass &= run_test("Test2_3x3", 3);
-    all_pass &= run_test("Test3_5x5", 5);
+    all_pass &= run_test("Fixed16_Test1_1x1_Bias", 1, 1);
+    all_pass &= run_test("Fixed16_Test2_3x3_Bias", 3, 1);
+    all_pass &= run_test("Fixed16_Test3_5x5_Bias", 5, 1);
 
     printf("\n=== Final Result: %s ===\n", all_pass ? "ALL PASS" : "SOME FAILED");
 

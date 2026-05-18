@@ -7,6 +7,8 @@
 //
 // Floating-point format: IEEE-754 half precision stored as uint16_t raw bits.
 // All matrices are 32x32 elements of uint16_t.
+//
+// This version enables real scalar bias support.
 // =============================================================================
 
 #include <stdio.h>
@@ -222,8 +224,10 @@ static inline uint64_t conv_store(void) {
 static void sw_conv_float16(
     const uint16_t *input,
     const uint16_t *kernel,
+    const uint16_t *bias,
     uint16_t       *output,
-    int             kernel_size)
+    int             kernel_size,
+    int             bias_enable)
 {
     int radius = kernel_size / 2;
 
@@ -251,6 +255,11 @@ static void sw_conv_float16(
                 }
             }
 
+            // Bias is one Float16 scalar added to every output pixel.
+            if (bias_enable) {
+                sum = half_add(sum, bias[0]);
+            }
+
             output[row * INPUT_SIZE + col] = sum;
         }
     }
@@ -261,8 +270,10 @@ static void sw_conv_float16(
 // =============================================================================
 static uint16_t input_buf [INPUT_ELEMS] __attribute__((aligned(64)));
 static uint16_t kernel_buf[5 * 5]       __attribute__((aligned(64)));
+static uint16_t bias_buf  [4]           __attribute__((aligned(64)));
 static uint16_t hw_output [INPUT_ELEMS] __attribute__((aligned(64)));
 static uint16_t sw_output [INPUT_ELEMS] __attribute__((aligned(64)));
+
 // Forward declaration
 static int check_output(const char *test_name);
 
@@ -275,11 +286,13 @@ static inline uint64_t read_cycle(void) {
 // =============================================================================
 // Run one complete test
 // =============================================================================
-static int run_test(const char *name, int kernel_size) {
+static int run_test(const char *name, int kernel_size, int bias_enable) {
     memset(hw_output, 0, sizeof(hw_output));
     memset(sw_output, 0, sizeof(sw_output));
+    memset(bias_buf, 0, sizeof(bias_buf));
 
-    printf("\n=== %s (kernel=%dx%d, float16) ===\n", name, kernel_size, kernel_size);
+    printf("\n=== %s (kernel=%dx%d, float16, bias=%s) ===\n",
+           name, kernel_size, kernel_size, bias_enable ? "on" : "off");
 
     // Fill input: value at (row, col) = row + col.
     for (int row = 0; row < INPUT_SIZE; row++) {
@@ -288,24 +301,27 @@ static int run_test(const char *name, int kernel_size) {
         }
     }
 
-    // Fill kernel: identity-like kernel.
+    // Fill kernel: all-one kernel for a non-trivial accumulation path.
     memset(kernel_buf, 0, sizeof(kernel_buf));
 
-for (int i = 0; i < kernel_size * kernel_size; i++) {
-    kernel_buf[i] = float_to_half_bits(1.0f);
-}
+    for (int i = 0; i < kernel_size * kernel_size; i++) {
+        kernel_buf[i] = float_to_half_bits(1.0f);
+    }
+
+    // Scalar bias: one Float16 value added to every output pixel.
+    bias_buf[0] = float_to_half_bits(1.5f);
 
     uint64_t t0, t1;
     uint64_t ret;
 
-    // Ensure CPU writes to input/kernel/output buffers are visible.
+    // Ensure CPU writes to input/kernel/bias/output buffers are visible.
     asm volatile("fence rw, rw" ::: "memory");
 
     t0 = read_cycle();
 
-    // CONFIG: float16, no bias.
+    // CONFIG: float16, optional scalar bias.
     ret = conv_config((uint64_t)kernel_size,
-                      CONFIG_FLAGS(DATA_FLOAT16, 0));
+                      CONFIG_FLAGS(DATA_FLOAT16, bias_enable));
     if (!ret) {
         printf("[%s] CONFIG failed\n", name);
         return 0;
@@ -314,8 +330,7 @@ for (int i = 0; i < kernel_size * kernel_size; i++) {
     asm volatile("fence rw, rw" ::: "memory");
 
     // KERNEL: kernel address + bias address.
-    // Bias is disabled, so bias address is zero.
-    ret = conv_kernel(kernel_buf, (void *)0);
+    ret = conv_kernel(kernel_buf, bias_enable ? bias_buf : (void *)0);
     if (!ret) {
         printf("[%s] KERNEL failed\n", name);
         return 0;
@@ -351,7 +366,7 @@ for (int i = 0; i < kernel_size * kernel_size; i++) {
 
     // Software reference.
     t0 = read_cycle();
-    sw_conv_float16(input_buf, kernel_buf, sw_output, kernel_size);
+    sw_conv_float16(input_buf, kernel_buf, bias_buf, sw_output, kernel_size, bias_enable);
     t1 = read_cycle();
 
     uint64_t sw_cycles = t1 - t0;
@@ -407,13 +422,13 @@ static int check_output(const char *test_name) {
 // Main
 // =============================================================================
 int main(void) {
-    printf("=== ELEN90093 Convolution Accelerator Float16 Test ===\n");
+    printf("=== ELEN90093 Convolution Accelerator Float16 Bias Test ===\n");
 
     int all_pass = 1;
 
-    all_pass &= run_test("Float16_Test1_1x1", 1);
-    all_pass &= run_test("Float16_Test2_3x3", 3);
-    all_pass &= run_test("Float16_Test3_5x5", 5);
+    all_pass &= run_test("Float16_Test1_1x1_Bias", 1, 1);
+    all_pass &= run_test("Float16_Test2_3x3_Bias", 3, 1);
+    all_pass &= run_test("Float16_Test3_5x5_Bias", 5, 1);
 
     printf("\n=== Final Result: %s ===\n", all_pass ? "ALL PASS" : "SOME FAILED");
 
