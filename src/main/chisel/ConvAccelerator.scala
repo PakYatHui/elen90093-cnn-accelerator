@@ -10,7 +10,7 @@ import freechips.rocketchip.rocket._
 import hardfloat._
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel")
+  println("DEBUG: Elaborating MyConvAccel streaming sliding-pipo version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -18,44 +18,79 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   extends LazyRoCCModuleImp(outer)
   with HasCoreParameters {
 
-  // Buffer incoming commands from the RoCC interface.
+  // ---------------------------------------------------------------------------
+  // External RoCC command interface
+  // ---------------------------------------------------------------------------
   val cmd = Queue(io.cmd, 1)
 
-  // Fixed design parameters.
+  // ---------------------------------------------------------------------------
+  // Fixed design parameters
+  // ---------------------------------------------------------------------------
   val INPUT_SIZE       = 32
   val INPUT_ELEMS      = INPUT_SIZE * INPUT_SIZE
   val MAX_KERNEL_SIZE  = 5
   val MAX_KERNEL_ELEMS = MAX_KERNEL_SIZE * MAX_KERNEL_SIZE
+  val MAX_TAGS         = 4
 
-  // Return values.
+  // Return values
   val RET_ERROR   = 0.U(xLen.W)
   val RET_SUCCESS = 1.U(xLen.W)
 
-  // Data type encoding.
+  // Data type encoding
   val DATA_FIXED16 = 0.U(2.W)
   val DATA_FLOAT16 = 1.U(2.W)
 
-  // Load response type encoding.
-  val LOAD_INPUT  = 0.U(2.W)
-  val LOAD_KERNEL = 1.U(2.W)
-  val LOAD_BIAS   = 2.U(2.W)
-
-  // Float16 parameters for HardFloat.
-  val FP16_EXP_WIDTH = 5
-  val FP16_SIG_WIDTH = 11
-
-  // funct7 encoding.
+  // funct7 encoding
   val FUNCT_CONFIG  = 0.U(7.W)
   val FUNCT_DATA    = 1.U(7.W)
   val FUNCT_COMPUTE = 2.U(7.W)
   val FUNCT_STORE   = 3.U(7.W)
   val FUNCT_KERNEL  = 4.U(7.W)
 
-  // FSM states.
+  // Preload load type encoding
+  val PRELOAD_KERNEL = 0.U(2.W)
+  val PRELOAD_BIAS   = 1.U(2.W)
+
+  // Runtime tag type encoding
+  val TAG_FREE        = 0.U(3.W)
+  val TAG_LOAD_WINDOW = 1.U(3.W)
+  val TAG_STORE_OUT   = 2.U(3.W)
+
+  // Window buffer state encoding
+  val BUF_FREE      = 0.U(2.W)
+  val BUF_LOADING   = 1.U(2.W)
+  val BUF_READY     = 2.U(2.W)
+  val BUF_COMPUTING = 3.U(2.W)
+
+  // Float16 parameters for HardFloat
+  val FP16_EXP_WIDTH = 5
+  val FP16_SIG_WIDTH = 11
+
+  // FSM states
   val sIdle :: sDecode :: sConfig :: sKernel :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
-  // Latched command fields.
+  // ---------------------------------------------------------------------------
+  // Queue metadata types
+  // ---------------------------------------------------------------------------
+  class WindowMeta extends Bundle {
+    val bufId  = UInt(1.W)
+    val outIdx = UInt(10.W)
+    val row    = UInt(5.W)
+    val col    = UInt(5.W)
+  }
+
+  class OutputMeta extends Bundle {
+    val baseIdx = UInt(10.W)
+    val data    = UInt(64.W)
+  }
+
+  val windowReadyQ = Module(new Queue(new WindowMeta, 2, pipe = true, flow = false))
+  val outputQ      = Module(new Queue(new OutputMeta, 4, pipe = true, flow = false))
+
+  // ---------------------------------------------------------------------------
+  // Latched command fields
+  // ---------------------------------------------------------------------------
   val functReg = RegInit(0.U(7.W))
   val rs1Reg   = RegInit(0.U(xLen.W))
   val rs2Reg   = RegInit(0.U(xLen.W))
@@ -63,7 +98,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val dprvReg  = RegInit(0.U(2.W))
   val xdReg    = RegInit(false.B)
 
-  // Runtime configuration registers.
+  // ---------------------------------------------------------------------------
+  // Runtime configuration registers
+  // ---------------------------------------------------------------------------
   val inputAddrReg   = RegInit(0.U(xLen.W))
   val kernelAddrReg  = RegInit(0.U(xLen.W))
   val outputAddrReg  = RegInit(0.U(xLen.W))
@@ -73,48 +110,111 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val dataTypeReg    = RegInit(DATA_FIXED16)
   val biasEnableReg  = RegInit(false.B)
 
-  // Command-sequence protection flags.
+  // Command sequence protection flags
   val configuredReg       = RegInit(false.B)
   val kernelConfiguredReg = RegInit(false.B)
   val loadedReg           = RegInit(false.B)
   val computedReg         = RegInit(false.B)
 
-  // Response register.
+  // Response register
   val resultReg = RegInit(RET_ERROR)
 
-  // Internal accelerator buffers.
-  // UInt(16.W) allows both fixed16 raw bits and float16 raw bits.
-  val inputBuf  = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
+  // ---------------------------------------------------------------------------
+  // Streaming datapath storage
+  // ---------------------------------------------------------------------------
   val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
-  val outputBuf = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
   val biasBuf   = RegInit(0.U(16.W))
 
-  // Load/store bookkeeping.
-  // inputLoadIdx and storeIdx are element indices.
-  // The input loader advances by 4 elements because it uses 64-bit loads.
-  val inputLoadIdx  = RegInit(0.U(11.W))
-  val kernelLoadIdx = RegInit(0.U(6.W))
-  val storeIdx      = RegInit(0.U(11.W))
-  val memInflight   = RegInit(false.B)
-  val issuedLoadType = RegInit(LOAD_INPUT)
-  val issuedIndex   = RegInit(0.U(11.W))
-  val issuedWide    = RegInit(false.B)
-  val biasLoaded    = RegInit(true.B)
+  // Two 25-element PIPO / ping-pong window buffers.
+  // Only one is written by the load stage while the other may be read by compute.
+  val windowBuf = Reg(Vec(2, Vec(MAX_KERNEL_ELEMS, UInt(16.W))))
+  val bufState  = RegInit(VecInit(Seq.fill(2)(BUF_FREE)))
+  val bufFillCount = RegInit(VecInit(Seq.fill(2)(0.U(6.W))))
+  val bufOutIdx = Reg(Vec(2, UInt(10.W)))
+  val bufRow    = Reg(Vec(2, UInt(5.W)))
+  val bufCol    = Reg(Vec(2, UInt(5.W)))
 
-  // Compute output pixel bookkeeping.
-  val outRow = RegInit(0.U(6.W))
-  val outCol = RegInit(0.U(6.W))
+  // ---------------------------------------------------------------------------
+  // DATA-stage preload bookkeeping: load kernel and optional scalar bias
+  // ---------------------------------------------------------------------------
+  val preloadKernelIdx = RegInit(0.U(6.W))
+  val preloadInflight  = RegInit(false.B)
+  val preloadType      = RegInit(PRELOAD_KERNEL)
+  val preloadIndex     = RegInit(0.U(6.W))
+  val preloadWide      = RegInit(false.B)
+  val preloadBiasDone  = RegInit(true.B)
 
-  // Sequential MAC bookkeeping.
-  val macKr  = RegInit(0.U(3.W))
-  val macKc  = RegInit(0.U(3.W))
-  val macIdx = RegInit(0.U(6.W))
+  // ---------------------------------------------------------------------------
+  // Streaming load stage bookkeeping
+  // ---------------------------------------------------------------------------
+  val nextWindowIdx = RegInit(0.U(11.W))
+  val loadActive    = RegInit(false.B)
+  val loadBufId     = RegInit(0.U(1.W))
+  val loadOutIdx    = RegInit(0.U(10.W))
+  val loadRow       = RegInit(0.U(5.W))
+  val loadCol       = RegInit(0.U(5.W))
+  val loadKr        = RegInit(0.U(3.W))
+  val loadKc        = RegInit(0.U(3.W))
+  val loadElemIdx   = RegInit(0.U(5.W))
 
-  // Sequential accumulators.
+  // Completed window waiting to be pushed into windowReadyQ.
+  val loadEnqPending = RegInit(false.B)
+  val loadEnqBufId   = RegInit(0.U(1.W))
+
+  // Sliding-window reuse bookkeeping.
+  // reuse* points to the most recently completed window buffer. When the next
+  // output is in the same row and col+1, the loader copies K*(K-1) values from
+  // the previous window into the destination PIPO buffer and only reads the new
+  // rightmost column from memory.
+  val loadSlideMode = RegInit(false.B)
+  val reuseValid    = RegInit(false.B)
+  val reuseBufId    = RegInit(0.U(1.W))
+  val reuseOutIdx   = RegInit(0.U(10.W))
+
+  // ---------------------------------------------------------------------------
+  // Streaming compute stage bookkeeping
+  // ---------------------------------------------------------------------------
+  val computeActive   = RegInit(false.B)
+  val computeBufId    = RegInit(0.U(1.W))
+  val computeOutIdx   = RegInit(0.U(10.W))
+  val computeRow      = RegInit(0.U(5.W))
+  val computeCol      = RegInit(0.U(5.W))
+  val computeMacIdx   = RegInit(0.U(6.W))
+  val computedOutCnt  = RegInit(0.U(11.W))
+
   val fixedAcc = RegInit(0.S(40.W))
   val floatAcc = RegInit(0.U(16.W))
 
-  // Helper wires.
+  // 64-bit packed output store aggregator.
+  // Four sequential 16-bit outputs are packed into one 64-bit outputQ entry.
+  val packCount   = RegInit(0.U(2.W))
+  val packBaseIdx = RegInit(0.U(10.W))
+  val packData    = RegInit(0.U(64.W))
+
+  val pendingPackValid = RegInit(false.B)
+  val pendingPackBits  = Reg(new OutputMeta)
+
+  // ---------------------------------------------------------------------------
+  // Runtime tag table for memory response routing during sCompute
+  // ---------------------------------------------------------------------------
+  val tagValid     = RegInit(VecInit(Seq.fill(MAX_TAGS)(false.B)))
+  val tagType      = RegInit(VecInit(Seq.fill(MAX_TAGS)(TAG_FREE)))
+  val tagBufId     = Reg(Vec(MAX_TAGS, UInt(1.W)))
+  val tagElemIdx   = Reg(Vec(MAX_TAGS, UInt(5.W)))
+  val tagElemCount = Reg(Vec(MAX_TAGS, UInt(3.W)))
+  val tagOutIdx    = Reg(Vec(MAX_TAGS, UInt(10.W)))
+
+  val freeTagMask = VecInit(tagValid.map(v => !v)).asUInt
+  val hasFreeTag  = freeTagMask.orR
+  val freeTag     = PriorityEncoder(freeTagMask)
+  val anyTagValid = tagValid.asUInt.orR
+
+  // Simple round-robin preference between store and load on the single RoCC mem port.
+  val preferStoreReg = RegInit(true.B)
+
+  // ---------------------------------------------------------------------------
+  // Command decode helper wires
+  // ---------------------------------------------------------------------------
   val doConfig  = functReg === FUNCT_CONFIG
   val doData    = functReg === FUNCT_DATA
   val doCompute = functReg === FUNCT_COMPUTE
@@ -127,10 +227,11 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val validDataType =
     (rs2Reg(1, 0) === DATA_FIXED16) || (rs2Reg(1, 0) === DATA_FLOAT16)
 
-  // Default command handshake.
+  // ---------------------------------------------------------------------------
+  // Default IO assignments
+  // ---------------------------------------------------------------------------
   cmd.ready := false.B
 
-  // Default response interface.
   io.resp.valid := false.B
   io.resp.bits.rd := rdReg
   io.resp.bits.data := resultReg
@@ -138,7 +239,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.busy := state =/= sIdle
   io.interrupt := false.B
 
-  // Default memory request interface.
   io.mem.req.valid := false.B
   io.mem.req.bits.addr := 0.U
   io.mem.req.bits.tag := 0.U
@@ -149,110 +249,130 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.data := 0.U
   io.mem.req.bits.dprv := dprvReg
 
-  when(cmd.fire) {
-    printf("[MyConvAccel] CMD fire funct=%d rs1=%x rs2=%x rd=%d xd=%d state=%d\n",
-      cmd.bits.inst.funct,
-      cmd.bits.rs1,
-      cmd.bits.rs2,
-      cmd.bits.inst.rd,
-      cmd.bits.inst.xd,
-      state
-    )
-  }
+  windowReadyQ.io.enq.valid := false.B
+  windowReadyQ.io.enq.bits.bufId := 0.U
+  windowReadyQ.io.enq.bits.outIdx := 0.U
+  windowReadyQ.io.enq.bits.row := 0.U
+  windowReadyQ.io.enq.bits.col := 0.U
+  windowReadyQ.io.deq.ready := false.B
 
-  // Float16 multiply using HardFloat.
+  outputQ.io.enq.valid := false.B
+  outputQ.io.enq.bits.baseIdx := 0.U
+  outputQ.io.enq.bits.data := 0.U
+  outputQ.io.deq.ready := false.B
+
+  // ---------------------------------------------------------------------------
+  // HardFloat helpers
+  // ---------------------------------------------------------------------------
   def fp16Mul(a: UInt, b: UInt): UInt = {
     val mul = Module(new MulRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
-
     mul.io.a := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, a)
     mul.io.b := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, b)
     mul.io.roundingMode := 0.U(3.W)
     mul.io.detectTininess := 0.U(1.W)
-
     fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, mul.io.out)
   }
 
-  // Float16 add using HardFloat.
   def fp16Add(a: UInt, b: UInt): UInt = {
     val add = Module(new AddRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
-
     add.io.subOp := false.B
     add.io.a := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, a)
     add.io.b := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, b)
     add.io.roundingMode := 0.U(3.W)
     add.io.detectTininess := 0.U(1.W)
-
     fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, add.io.out)
   }
 
-  // Return fixed16 input value for the selected runtime kernel position.
-  // Out-of-range accesses implement zero padding.
-  def getInputAtFixed(baseRow: UInt, baseCol: UInt, kr: UInt, kc: UInt): SInt = {
-    val radius = kernelSizeReg >> 1
+  // ---------------------------------------------------------------------------
+  // Compute datapath wires
+  // ---------------------------------------------------------------------------
+  val computeInputVal  = windowBuf(computeBufId)(computeMacIdx(4, 0))
+  val computeKernelVal = kernelBuf(computeMacIdx(4, 0))
 
-    val rowS = baseRow.zext + kr.zext - radius.zext
-    val colS = baseCol.zext + kc.zext - radius.zext
-
-    val rowValid = rowS >= 0.S && rowS < INPUT_SIZE.S
-    val colValid = colS >= 0.S && colS < INPUT_SIZE.S
-
-    val rowIdx = rowS.asUInt
-    val colIdx = colS.asUInt
-    val inputIndex = (rowIdx << 5) + colIdx
-
-    Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)).asSInt, 0.S(16.W))
-  }
-
-  // Return raw float16 bits for the selected runtime kernel position.
-  // Out-of-range accesses return +0.0 half-precision.
-  def getInputAtFloat16(baseRow: UInt, baseCol: UInt, kr: UInt, kc: UInt): UInt = {
-    val radius = kernelSizeReg >> 1
-
-    val rowS = baseRow.zext + kr.zext - radius.zext
-    val colS = baseCol.zext + kc.zext - radius.zext
-
-    val rowValid = rowS >= 0.S && rowS < INPUT_SIZE.S
-    val colValid = colS >= 0.S && colS < INPUT_SIZE.S
-
-    val rowIdx = rowS.asUInt
-    val colIdx = colS.asUInt
-    val inputIndex = (rowIdx << 5) + colIdx
-
-    Mux(rowValid && colValid, inputBuf(inputIndex(9, 0)), 0.U(16.W))
-  }
-
-  // Current output index.
-  val outIndex = (outRow << 5) + outCol
-
-  // Sequential fixed16 MAC datapath.
-  val fixedInVal  = getInputAtFixed(outRow, outCol, macKr, macKc)
-  val fixedKerVal = kernelBuf(macIdx(4, 0)).asSInt
-
-  // 8.8 x 8.8 produces 16.16.
-  // Shift right by 8 to return to 8.8 scale.
-  val fixedTermRaw = (fixedInVal * fixedKerVal) >> 8
+  // Fixed16: 8.8 x 8.8 -> 16.16, then >> 8 back to 8.8.
+  val fixedTermRaw = (computeInputVal.asSInt * computeKernelVal.asSInt) >> 8
   val fixedTerm = Wire(SInt(40.W))
   fixedTerm := fixedTermRaw
-
   val nextFixedAcc = (fixedAcc + fixedTerm).asUInt(39, 0).asSInt
-
-  // Fixed16 bias is stored in the same 8.8 format as input/kernel/output.
   val fixedBiasTerm = Wire(SInt(40.W))
   fixedBiasTerm := Mux(biasEnableReg, biasBuf.asSInt, 0.S(16.W))
-  val finalFixedAccWithBias = (nextFixedAcc + fixedBiasTerm).asUInt(39, 0).asSInt
+  val finalFixedAcc = (nextFixedAcc + fixedBiasTerm).asUInt(39, 0).asSInt
+  val finalFixedOut = finalFixedAcc.asUInt(15, 0)
 
-  // Sequential Float16 MAC datapath.
-  val floatInVal   = getInputAtFloat16(outRow, outCol, macKr, macKc)
-  val floatKerVal  = kernelBuf(macIdx(4, 0))
-  val floatTerm    = fp16Mul(floatInVal, floatKerVal)
+  // Float16: HardFloat multiply then HardFloat add.
+  val floatTerm = fp16Mul(computeInputVal, computeKernelVal)
   val nextFloatAcc = fp16Add(floatAcc, floatTerm)
-  val finalFloatAccWithBias = Mux(biasEnableReg, fp16Add(nextFloatAcc, biasBuf), nextFloatAcc)
+  val finalFloatOut = Mux(biasEnableReg, fp16Add(nextFloatAcc, biasBuf), nextFloatAcc)
 
-  // Kernel and output scanning helpers.
-  val lastMacTerm   = macIdx === (kernelElemsReg - 1.U)
-  val lastKernelCol = macKc === (kernelSizeReg - 1.U)
-  val lastOutPixel  = (outRow === (INPUT_SIZE - 1).U) && (outCol === (INPUT_SIZE - 1).U)
+  val finalOut16 = Mux(dataTypeReg === DATA_FLOAT16, finalFloatOut, finalFixedOut)
+  val lastMacTerm = computeMacIdx === (kernelElemsReg - 1.U)
 
+  // ---------------------------------------------------------------------------
+  // Window-load address generation wires
+  // ---------------------------------------------------------------------------
+  val loadRadius = kernelSizeReg >> 1
+  val loadRowS = loadRow.zext + loadKr.zext - loadRadius.zext
+  val loadColS = loadCol.zext + loadKc.zext - loadRadius.zext
+  val loadColEndS = loadCol.zext + (loadKc + 3.U).zext - loadRadius.zext
+
+  val loadRowValid = loadRowS >= 0.S && loadRowS < INPUT_SIZE.S
+  val loadColValid = loadColS >= 0.S && loadColS < INPUT_SIZE.S
+  val loadGroupColValid = loadColEndS >= 0.S && loadColEndS < INPUT_SIZE.S
+
+  val loadScalarValid = loadRowValid && loadColValid
+  val loadMemIndex = (loadRowS.asUInt << 5) + loadColS.asUInt
+  val loadMemAddr = inputAddrReg + (loadMemIndex << 1)
+
+  // A 64-bit HellaCache load must be naturally aligned.
+  // 5x5 windows may start at arbitrary input columns, so many legal window
+  // positions are only 16-bit aligned. Falling back to scalar loads avoids
+  // SimpleHellaCacheIF alignment exceptions.
+  val loadMemAddrAligned64 = loadMemAddr(2, 0) === 0.U
+
+  val loadCanWide =
+    !loadSlideMode &&
+    (loadKc + 3.U) < kernelSizeReg &&
+    loadRowValid && loadColValid && loadGroupColValid &&
+    loadMemAddrAligned64
+
+  // ---------------------------------------------------------------------------
+  // Helper method for advancing the logical window element cursor
+  // ---------------------------------------------------------------------------
+  def advanceLoadCursor(count: UInt): Unit = {
+    when(loadSlideMode) {
+      // Sliding mode only loads the new rightmost column. The next element is
+      // the same kernel column in the next kernel row, so its compact KxK index
+      // advances by kernelSizeReg instead of by one.
+      loadElemIdx := loadElemIdx + kernelSizeReg
+      loadKr := loadKr + 1.U
+      loadKc := kernelSizeReg - 1.U
+    }.otherwise {
+      val nextKc = loadKc + count
+      loadElemIdx := loadElemIdx + count
+      when(nextKc >= kernelSizeReg) {
+        loadKc := 0.U
+        loadKr := loadKr + 1.U
+      }.otherwise {
+        loadKc := nextKc
+      }
+    }
+  }
+
+  def finishWindowIfFilled(buf: UInt, newCount: UInt): Unit = {
+    when(newCount >= kernelElemsReg) {
+      bufState(buf) := BUF_READY
+      loadActive := false.B
+      loadEnqPending := true.B
+      loadEnqBufId := buf
+      reuseValid := true.B
+      reuseBufId := buf
+      reuseOutIdx := bufOutIdx(buf)
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Main FSM
+  // ---------------------------------------------------------------------------
   switch(state) {
 
     is(sIdle) {
@@ -278,70 +398,71 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           state := sKernel
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] KERNEL rejected: accelerator is not configured\n")
           state := sRespond
         }
 
       }.elsewhen(doData) {
         when(configuredReg && kernelConfiguredReg) {
-          inputAddrReg  := rs1Reg
+          inputAddrReg := rs1Reg
           outputAddrReg := rs2Reg
-          inputLoadIdx  := 0.U
-          kernelLoadIdx := 0.U
-          biasLoaded    := !biasEnableReg
-          memInflight   := false.B
 
-          printf("[MyConvAccel] Decode -> Data inputAddr=%x outputAddr=%x kernelAddr=%x biasAddr=%x kernelSize=%d dataType=%d biasEnable=%d\n",
-            rs1Reg, rs2Reg, kernelAddrReg, biasAddrReg, kernelSizeReg, dataTypeReg, biasEnableReg)
+          preloadKernelIdx := 0.U
+          preloadInflight := false.B
+          preloadBiasDone := !biasEnableReg
+          loadedReg := false.B
+          computedReg := false.B
 
           state := sLoad
-
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] DATA rejected: missing CONFIG or KERNEL\n")
           state := sRespond
         }
 
       }.elsewhen(doCompute) {
         when(configuredReg && kernelConfiguredReg && loadedReg) {
-          outRow := 0.U
-          outCol := 0.U
-
-          macKr  := 0.U
-          macKc  := 0.U
-          macIdx := 0.U
-
+          // Reset streaming control state for a new run.
+          nextWindowIdx := 0.U
+          loadActive := false.B
+          loadEnqPending := false.B
+          loadSlideMode := false.B
+          reuseValid := false.B
+          computeActive := false.B
+          computeMacIdx := 0.U
+          computedOutCnt := 0.U
           fixedAcc := 0.S
           floatAcc := 0.U
+          packCount := 0.U
+          packBaseIdx := 0.U
+          packData := 0.U
+          pendingPackValid := false.B
+          preferStoreReg := true.B
 
-          printf("[MyConvAccel] Decode -> Compute kernelSize=%d dataType=%d biasEnable=%d bias=%x\n",
-            kernelSizeReg, dataTypeReg, biasEnableReg, biasBuf)
+          for (i <- 0 until 2) {
+            bufState(i) := BUF_FREE
+            bufFillCount(i) := 0.U
+          }
+          for (i <- 0 until MAX_TAGS) {
+            tagValid(i) := false.B
+            tagType(i) := TAG_FREE
+          }
 
+          computedReg := false.B
           state := sCompute
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] COMPUTE rejected: missing CONFIG, KERNEL, or DATA\n")
           state := sRespond
         }
 
       }.elsewhen(doStore) {
-        when(configuredReg && kernelConfiguredReg && loadedReg && computedReg) {
-          storeIdx := 0.U
-          memInflight := false.B
-
-          printf("[MyConvAccel] Decode -> Store outputAddr=%x dataType=%d\n",
-            outputAddrReg, dataTypeReg)
-
-          state := sStore
+        when(computedReg) {
+          resultReg := RET_SUCCESS
         }.otherwise {
           resultReg := RET_ERROR
-          printf("[MyConvAccel] STORE rejected: missing CONFIG, KERNEL, DATA, or COMPUTE\n")
-          state := sRespond
         }
+        state := sRespond
 
       }.otherwise {
         resultReg := RET_ERROR
-        printf("[MyConvAccel] Illegal funct=%d\n", functReg)
         state := sRespond
       }
     }
@@ -365,10 +486,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         loadedReg := false.B
         computedReg := false.B
         resultReg := RET_SUCCESS
-
-        printf("[MyConvAccel] CONFIG success kernelSize=%d dataType=%d biasEnable=%d\n",
-          rs1Reg, rs2Reg(1, 0), rs2Reg(2))
-
       }.otherwise {
         configuredReg := false.B
         kernelConfiguredReg := false.B
@@ -380,9 +497,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         biasEnableReg := false.B
         biasBuf := 0.U
         resultReg := RET_ERROR
-
-        printf("[MyConvAccel] CONFIG error kernelSize=%d dataType=%d\n",
-          rs1Reg, rs2Reg(1, 0))
       }
 
       state := sRespond
@@ -391,76 +505,55 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     is(sKernel) {
       kernelAddrReg := rs1Reg
       biasAddrReg := rs2Reg
-
       kernelConfiguredReg := true.B
       loadedReg := false.B
       computedReg := false.B
       resultReg := RET_SUCCESS
-
-      printf("[MyConvAccel] KERNEL success kernelAddr=%x biasAddr=%x biasEnable=%d\n",
-        rs1Reg, rs2Reg, biasEnableReg)
-
       state := sRespond
     }
 
     is(sLoad) {
-      // Blocking load is preserved for low risk, but input and most kernel reads
-      // now use 64-bit memory loads to fetch four 16-bit elements per request.
-      when(!memInflight) {
-        when(inputLoadIdx < INPUT_ELEMS.U) {
+      // DATA stage now preloads only kernel weights and optional scalar bias.
+      // Input windows are loaded later inside sCompute using PIPO buffers.
+      when(!preloadInflight) {
+        when(preloadKernelIdx < kernelElemsReg) {
+          val kernelWideLoad = (preloadKernelIdx + 3.U) < kernelElemsReg
+
           io.mem.req.valid := true.B
-          io.mem.req.bits.addr := inputAddrReg + (inputLoadIdx << 1)
+          io.mem.req.bits.addr := kernelAddrReg + (preloadKernelIdx << 1)
           io.mem.req.bits.tag := 0.U
-          io.mem.req.bits.cmd := M_XRD
-          io.mem.req.bits.size := 3.U
-          io.mem.req.bits.signed := true.B
-
-          when(io.mem.req.fire) {
-            memInflight := true.B
-            issuedLoadType := LOAD_INPUT
-            issuedIndex := inputLoadIdx
-            issuedWide := true.B
-          }
-
-        }.elsewhen(kernelLoadIdx < kernelElemsReg) {
-          val kernelWideLoad = (kernelLoadIdx + 3.U) < kernelElemsReg
-
-          io.mem.req.valid := true.B
-          io.mem.req.bits.addr := kernelAddrReg + (kernelLoadIdx << 1)
-          io.mem.req.bits.tag := 1.U
           io.mem.req.bits.cmd := M_XRD
           io.mem.req.bits.size := Mux(kernelWideLoad, 3.U, 1.U)
           io.mem.req.bits.signed := true.B
+          io.mem.req.bits.dprv := dprvReg
 
           when(io.mem.req.fire) {
-            memInflight := true.B
-            issuedLoadType := LOAD_KERNEL
-            issuedIndex := kernelLoadIdx
-            issuedWide := kernelWideLoad
+            preloadInflight := true.B
+            preloadType := PRELOAD_KERNEL
+            preloadIndex := preloadKernelIdx
+            preloadWide := kernelWideLoad
           }
 
-        }.elsewhen(biasEnableReg && !biasLoaded) {
+        }.elsewhen(biasEnableReg && !preloadBiasDone) {
           io.mem.req.valid := true.B
           io.mem.req.bits.addr := biasAddrReg
-          io.mem.req.bits.tag := 2.U
+          io.mem.req.bits.tag := 1.U
           io.mem.req.bits.cmd := M_XRD
           io.mem.req.bits.size := 1.U
           io.mem.req.bits.signed := true.B
+          io.mem.req.bits.dprv := dprvReg
 
           when(io.mem.req.fire) {
-            memInflight := true.B
-            issuedLoadType := LOAD_BIAS
-            issuedIndex := 0.U
-            issuedWide := false.B
+            preloadInflight := true.B
+            preloadType := PRELOAD_BIAS
+            preloadIndex := 0.U
+            preloadWide := false.B
           }
 
         }.otherwise {
           loadedReg := true.B
           computedReg := false.B
           resultReg := RET_SUCCESS
-
-          printf("[MyConvAccel] DATA/LOAD complete bias=%x\n", biasBuf)
-
           state := sRespond
         }
       }
@@ -468,207 +561,335 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       when(io.mem.resp.valid) {
         val loadedData = io.mem.resp.bits.data
 
-        when(issuedLoadType === LOAD_INPUT) {
-          inputBuf(issuedIndex(9, 0)) := loadedData(15, 0)
-          inputBuf((issuedIndex + 1.U)(9, 0)) := loadedData(31, 16)
-          inputBuf((issuedIndex + 2.U)(9, 0)) := loadedData(47, 32)
-          inputBuf((issuedIndex + 3.U)(9, 0)) := loadedData(63, 48)
-          inputLoadIdx := inputLoadIdx + 4.U
-
-        }.elsewhen(issuedLoadType === LOAD_KERNEL) {
-          kernelBuf(issuedIndex(4, 0)) := loadedData(15, 0)
-
-          when(issuedWide) {
-            kernelBuf((issuedIndex + 1.U)(4, 0)) := loadedData(31, 16)
-            kernelBuf((issuedIndex + 2.U)(4, 0)) := loadedData(47, 32)
-            kernelBuf((issuedIndex + 3.U)(4, 0)) := loadedData(63, 48)
-            kernelLoadIdx := issuedIndex(5, 0) + 4.U
+        when(preloadType === PRELOAD_KERNEL) {
+          kernelBuf(preloadIndex(4, 0)) := loadedData(15, 0)
+          when(preloadWide) {
+            kernelBuf((preloadIndex + 1.U)(4, 0)) := loadedData(31, 16)
+            kernelBuf((preloadIndex + 2.U)(4, 0)) := loadedData(47, 32)
+            kernelBuf((preloadIndex + 3.U)(4, 0)) := loadedData(63, 48)
+            preloadKernelIdx := preloadIndex + 4.U
           }.otherwise {
-            kernelLoadIdx := issuedIndex(5, 0) + 1.U
+            preloadKernelIdx := preloadIndex + 1.U
           }
-
-        }.elsewhen(issuedLoadType === LOAD_BIAS) {
+        }.otherwise {
           biasBuf := loadedData(15, 0)
-          biasLoaded := true.B
+          preloadBiasDone := true.B
         }
 
-        memInflight := false.B
+        preloadInflight := false.B
       }
     }
 
     is(sCompute) {
-      // Sequential MAC:
-      // one kernel term is accumulated per cycle.
+      // -----------------------------------------------------------------------
+      // 1. Push a completed load buffer into windowReadyQ when possible.
+      // -----------------------------------------------------------------------
+      when(loadEnqPending) {
+        windowReadyQ.io.enq.valid := true.B
+        windowReadyQ.io.enq.bits.bufId := loadEnqBufId
+        windowReadyQ.io.enq.bits.outIdx := bufOutIdx(loadEnqBufId)
+        windowReadyQ.io.enq.bits.row := bufRow(loadEnqBufId)
+        windowReadyQ.io.enq.bits.col := bufCol(loadEnqBufId)
 
-      when(lastMacTerm) {
-        // Current output pixel finishes in this cycle.
-        val finalFixedOut16 = finalFixedAccWithBias.asUInt(15, 0)
-        val finalFloatOut16 = finalFloatAccWithBias
-
-        val finalOut16 = Mux(
-          dataTypeReg === DATA_FLOAT16,
-          finalFloatOut16,
-          finalFixedOut16
-        )
-
-        outputBuf(outIndex(9, 0)) := finalOut16
-
-        val watchComputeIdx =
-          (outIndex < 4.U) ||
-          (outIndex === 416.U) ||
-          (outIndex === 704.U) ||
-          (outIndex === 832.U) ||
-          (outIndex >= 1020.U)
-
-        when(watchComputeIdx) {
-          printf("[COMPUTE_DBG] idx=%d row=%d col=%d dataType=%d biasEnable=%d bias=%x out=%x macTerms=%d\n",
-            outIndex,
-            outRow,
-            outCol,
-            dataTypeReg,
-            biasEnableReg,
-            biasBuf,
-            finalOut16,
-            kernelElemsReg
-          )
+        when(windowReadyQ.io.enq.fire) {
+          loadEnqPending := false.B
         }
+      }
 
-        // Reset MAC state for the next output pixel.
-        macKr  := 0.U
-        macKc  := 0.U
-        macIdx := 0.U
+      // -----------------------------------------------------------------------
+      // 2. Enqueue pending packed output first, if outputQ was previously full.
+      // -----------------------------------------------------------------------
+      when(pendingPackValid) {
+        outputQ.io.enq.valid := true.B
+        outputQ.io.enq.bits := pendingPackBits
+        when(outputQ.io.enq.fire) {
+          pendingPackValid := false.B
+        }
+      }
 
-        fixedAcc := 0.S
-        floatAcc := 0.U
+      // -----------------------------------------------------------------------
+      // 3. Start loading a new output window into a free PIPO buffer.
+      // -----------------------------------------------------------------------
+      val free0 = bufState(0) === BUF_FREE
+      val free1 = bufState(1) === BUF_FREE
+      val hasFreeBuf = free0 || free1
 
-        when(lastOutPixel) {
-          outRow := 0.U
-          outCol := 0.U
+      // A sliding reuse is legal only for the next column in the same row. The
+      // destination PIPO buffer must be different from the source buffer so the
+      // load stage never overwrites the buffer used by compute/source reuse.
+      val nextOutIdx10 = nextWindowIdx(9, 0)
+      val nextCol5 = nextWindowIdx(4, 0)
+      val reuseIsPrev = reuseValid && nextCol5 =/= 0.U && reuseOutIdx === (nextOutIdx10 - 1.U)
+      val slideDestAvailable = Mux(reuseBufId === 0.U, free1, free0)
+      val useSlideForNew = reuseIsPrev && slideDestAvailable && (kernelSizeReg =/= 1.U)
+      val selectedBuf = Mux(useSlideForNew, ~reuseBufId, Mux(free0, 0.U(1.W), 1.U(1.W)))
 
-          computedReg := true.B
-          resultReg := RET_SUCCESS
+      when(!loadActive && !loadEnqPending && nextWindowIdx < INPUT_ELEMS.U && hasFreeBuf) {
+        val copiedCount = Mux(kernelSizeReg === 5.U, 20.U(6.W), Mux(kernelSizeReg === 3.U, 6.U(6.W), 0.U(6.W)))
+        val initialFill = Mux(useSlideForNew, copiedCount, 0.U(6.W))
+        val firstKc = Mux(useSlideForNew, kernelSizeReg - 1.U, 0.U)
+        val firstElem = Mux(useSlideForNew, kernelSizeReg - 1.U, 0.U)
 
-          printf("[MyConvAccel] COMPUTE complete\n")
+        loadActive := true.B
+        loadSlideMode := useSlideForNew
+        loadBufId := selectedBuf
+        loadOutIdx := nextOutIdx10
+        loadRow := nextWindowIdx(9, 5)
+        loadCol := nextCol5
+        loadKr := 0.U
+        loadKc := firstKc
+        loadElemIdx := firstElem
 
-          state := sRespond
+        bufState(selectedBuf) := BUF_LOADING
+        bufFillCount(selectedBuf) := initialFill
+        bufOutIdx(selectedBuf) := nextOutIdx10
+        bufRow(selectedBuf) := nextWindowIdx(9, 5)
+        bufCol(selectedBuf) := nextCol5
 
-        }.otherwise {
-          when(outCol === (INPUT_SIZE - 1).U) {
-            outCol := 0.U
-            outRow := outRow + 1.U
-          }.otherwise {
-            outCol := outCol + 1.U
+        // PIPO sliding copy. The destination buffer receives the left K-1
+        // columns from the previous window. The loader then fills only the new
+        // rightmost column. This preserves the pipeline-buffer design: load
+        // writes selectedBuf while compute may read reuseBufId.
+        when(useSlideForNew) {
+          when(kernelSizeReg === 3.U) {
+            windowBuf(selectedBuf)(0) := windowBuf(reuseBufId)(1)
+            windowBuf(selectedBuf)(1) := windowBuf(reuseBufId)(2)
+            windowBuf(selectedBuf)(3) := windowBuf(reuseBufId)(4)
+            windowBuf(selectedBuf)(4) := windowBuf(reuseBufId)(5)
+            windowBuf(selectedBuf)(6) := windowBuf(reuseBufId)(7)
+            windowBuf(selectedBuf)(7) := windowBuf(reuseBufId)(8)
+          }.elsewhen(kernelSizeReg === 5.U) {
+            windowBuf(selectedBuf)(0)  := windowBuf(reuseBufId)(1)
+            windowBuf(selectedBuf)(1)  := windowBuf(reuseBufId)(2)
+            windowBuf(selectedBuf)(2)  := windowBuf(reuseBufId)(3)
+            windowBuf(selectedBuf)(3)  := windowBuf(reuseBufId)(4)
+            windowBuf(selectedBuf)(5)  := windowBuf(reuseBufId)(6)
+            windowBuf(selectedBuf)(6)  := windowBuf(reuseBufId)(7)
+            windowBuf(selectedBuf)(7)  := windowBuf(reuseBufId)(8)
+            windowBuf(selectedBuf)(8)  := windowBuf(reuseBufId)(9)
+            windowBuf(selectedBuf)(10) := windowBuf(reuseBufId)(11)
+            windowBuf(selectedBuf)(11) := windowBuf(reuseBufId)(12)
+            windowBuf(selectedBuf)(12) := windowBuf(reuseBufId)(13)
+            windowBuf(selectedBuf)(13) := windowBuf(reuseBufId)(14)
+            windowBuf(selectedBuf)(15) := windowBuf(reuseBufId)(16)
+            windowBuf(selectedBuf)(16) := windowBuf(reuseBufId)(17)
+            windowBuf(selectedBuf)(17) := windowBuf(reuseBufId)(18)
+            windowBuf(selectedBuf)(18) := windowBuf(reuseBufId)(19)
+            windowBuf(selectedBuf)(20) := windowBuf(reuseBufId)(21)
+            windowBuf(selectedBuf)(21) := windowBuf(reuseBufId)(22)
+            windowBuf(selectedBuf)(22) := windowBuf(reuseBufId)(23)
+            windowBuf(selectedBuf)(23) := windowBuf(reuseBufId)(24)
           }
         }
 
-      }.otherwise {
-        // Accumulate current term.
-        fixedAcc := nextFixedAcc
-        floatAcc := nextFloatAcc
+        nextWindowIdx := nextWindowIdx + 1.U
+      }
 
-        // Move to the next kernel term.
-        macIdx := macIdx + 1.U
+      // -----------------------------------------------------------------------
+      // 4. Start compute from a ready window buffer.
+      // -----------------------------------------------------------------------
+      when(!computeActive && !pendingPackValid && windowReadyQ.io.deq.valid) {
+        windowReadyQ.io.deq.ready := true.B
 
-        when(lastKernelCol) {
-          macKc := 0.U
-          macKr := macKr + 1.U
-        }.otherwise {
-          macKc := macKc + 1.U
+        when(windowReadyQ.io.deq.fire) {
+          computeActive := true.B
+          computeBufId := windowReadyQ.io.deq.bits.bufId
+          computeOutIdx := windowReadyQ.io.deq.bits.outIdx
+          computeRow := windowReadyQ.io.deq.bits.row
+          computeCol := windowReadyQ.io.deq.bits.col
+          computeMacIdx := 0.U
+          fixedAcc := 0.S
+          floatAcc := 0.U
+          bufState(windowReadyQ.io.deq.bits.bufId) := BUF_COMPUTING
         }
+      }
+
+      // -----------------------------------------------------------------------
+      // 5. Sequential MAC compute: one kernel term per cycle.
+      // -----------------------------------------------------------------------
+      when(computeActive && !pendingPackValid) {
+        when(lastMacTerm) {
+          // Current output pixel finishes this cycle.
+          val completedOut = finalOut16
+
+          // Pack four sequential 16-bit outputs into one 64-bit output store.
+          when(packCount === 0.U) {
+            packBaseIdx := computeOutIdx
+            packData := completedOut
+            packCount := 1.U
+          }.elsewhen(packCount === 1.U) {
+            packData := packData | (completedOut << 16)
+            packCount := 2.U
+          }.elsewhen(packCount === 2.U) {
+            packData := packData | (completedOut << 32)
+            packCount := 3.U
+          }.otherwise {
+            val fullPack = packData | (completedOut << 48)
+
+            when(!pendingPackValid) {
+              outputQ.io.enq.valid := true.B
+              outputQ.io.enq.bits.baseIdx := packBaseIdx
+              outputQ.io.enq.bits.data := fullPack
+
+              when(outputQ.io.enq.fire) {
+                packCount := 0.U
+                packData := 0.U
+              }.otherwise {
+                pendingPackValid := true.B
+                pendingPackBits.baseIdx := packBaseIdx
+                pendingPackBits.data := fullPack
+                packCount := 0.U
+                packData := 0.U
+              }
+            }
+          }
+
+          bufState(computeBufId) := BUF_FREE
+          computeActive := false.B
+          computeMacIdx := 0.U
+          fixedAcc := 0.S
+          floatAcc := 0.U
+          computedOutCnt := computedOutCnt + 1.U
+
+        }.otherwise {
+          fixedAcc := nextFixedAcc
+          floatAcc := nextFloatAcc
+          computeMacIdx := computeMacIdx + 1.U
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // 6. Runtime memory response routing using tag table.
+      // -----------------------------------------------------------------------
+      when(io.mem.resp.valid) {
+        val rTag = io.mem.resp.bits.tag(log2Ceil(MAX_TAGS)-1, 0)
+        val rData = io.mem.resp.bits.data
+
+        when(tagValid(rTag)) {
+          when(tagType(rTag) === TAG_LOAD_WINDOW) {
+            val b = tagBufId(rTag)
+            val e = tagElemIdx(rTag)
+            val c = tagElemCount(rTag)
+
+            when(c >= 1.U) { windowBuf(b)(e) := rData(15, 0) }
+            when(c >= 2.U) { windowBuf(b)((e + 1.U)(4, 0)) := rData(31, 16) }
+            when(c >= 3.U) { windowBuf(b)((e + 2.U)(4, 0)) := rData(47, 32) }
+            when(c >= 4.U) { windowBuf(b)((e + 3.U)(4, 0)) := rData(63, 48) }
+
+            val newFill = bufFillCount(b) + c
+            bufFillCount(b) := newFill
+            finishWindowIfFilled(b, newFill)
+          }
+
+          // Store responses only free the tag.
+          tagValid(rTag) := false.B
+          tagType(rTag) := TAG_FREE
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // 7. Runtime memory scheduler.
+      //    Single io.mem.req port: choose either STORE_OUT or LOAD_WINDOW.
+      //    To avoid same-cycle tag state hazards, do not issue a new request in
+      //    a cycle where a memory response is being routed.
+      // -----------------------------------------------------------------------
+      when(!io.mem.resp.valid) {
+        // Local zero-padding does not consume the memory port.
+        when(loadActive && loadElemIdx < kernelElemsReg && !loadScalarValid) {
+          windowBuf(loadBufId)(loadElemIdx) := 0.U
+
+          val newFill = bufFillCount(loadBufId) + 1.U
+          bufFillCount(loadBufId) := newFill
+          advanceLoadCursor(1.U)
+          finishWindowIfFilled(loadBufId, newFill)
+
+        }.otherwise {
+          val canIssueStore = outputQ.io.deq.valid && hasFreeTag
+          val canIssueLoad = loadActive && (loadElemIdx < kernelElemsReg) && loadScalarValid && hasFreeTag
+
+          val chooseStore = canIssueStore && (!canIssueLoad || preferStoreReg)
+          val chooseLoad = canIssueLoad && (!canIssueStore || !preferStoreReg)
+
+          when(chooseStore) {
+            io.mem.req.valid := true.B
+            io.mem.req.bits.addr := outputAddrReg + (outputQ.io.deq.bits.baseIdx << 1)
+            io.mem.req.bits.tag := freeTag
+            io.mem.req.bits.cmd := M_XWR
+            io.mem.req.bits.size := 3.U       // 8 bytes = 64-bit full-width store
+            io.mem.req.bits.signed := false.B
+            io.mem.req.bits.data := outputQ.io.deq.bits.data
+            io.mem.req.bits.dprv := dprvReg
+
+            outputQ.io.deq.ready := io.mem.req.ready
+
+            when(io.mem.req.fire) {
+              tagValid(freeTag) := true.B
+              tagType(freeTag) := TAG_STORE_OUT
+              tagOutIdx(freeTag) := outputQ.io.deq.bits.baseIdx
+              preferStoreReg := false.B
+            }
+
+          }.elsewhen(chooseLoad) {
+            val wideCount = Mux(loadCanWide, 4.U(3.W), 1.U(3.W))
+
+            io.mem.req.valid := true.B
+            io.mem.req.bits.addr := loadMemAddr
+            io.mem.req.bits.tag := freeTag
+            io.mem.req.bits.cmd := M_XRD
+            io.mem.req.bits.size := Mux(loadCanWide, 3.U, 1.U)
+            io.mem.req.bits.signed := true.B
+            io.mem.req.bits.dprv := dprvReg
+
+            when(io.mem.req.fire) {
+              tagValid(freeTag) := true.B
+              tagType(freeTag) := TAG_LOAD_WINDOW
+              tagBufId(freeTag) := loadBufId
+              tagElemIdx(freeTag) := loadElemIdx
+              tagElemCount(freeTag) := wideCount
+
+              advanceLoadCursor(wideCount)
+              preferStoreReg := true.B
+            }
+          }
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // 8. Done condition: all windows issued, all outputs computed and packed,
+      //    outputQ drained, all store acks returned, no active buffers/requests.
+      // -----------------------------------------------------------------------
+      val allBuffersFree = (bufState(0) === BUF_FREE) && (bufState(1) === BUF_FREE)
+      val allWindowsIssued = nextWindowIdx >= INPUT_ELEMS.U
+      val allOutputsComputed = computedOutCnt >= INPUT_ELEMS.U
+      val queuesEmpty = !windowReadyQ.io.deq.valid && !outputQ.io.deq.valid
+      val noPendingWork = !loadActive && !loadEnqPending && !computeActive && !pendingPackValid
+      val noPackRemainder = packCount === 0.U
+
+      when(allWindowsIssued && allOutputsComputed && allBuffersFree && queuesEmpty && noPendingWork && noPackRemainder && !anyTagValid) {
+        computedReg := true.B
+        resultReg := RET_SUCCESS
+        state := sRespond
       }
     }
 
     is(sStore) {
-      // Write the 32x32 output matrix back to memory.
-      // Both fixed16 and float16 use 16-bit elements.
-      // Use one 64-bit full store for every four 16-bit output elements.
-
-      val watchStoreIdx =
-        (storeIdx < 16.U) ||
-        (storeIdx === 416.U) ||
-        (storeIdx === 704.U) ||
-        (storeIdx === 832.U) ||
-        (storeIdx >= 1008.U)
-
-      when(storeIdx < INPUT_ELEMS.U) {
-        when(!memInflight) {
-          io.mem.req.valid := true.B
-
-          // storeIdx is the starting 16-bit element index of this 64-bit store.
-          // Byte offset = storeIdx * 2.
-          io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
-
-          io.mem.req.bits.tag := 2.U
-          io.mem.req.bits.cmd := M_XWR
-
-          // size = log2(bytes). 3 means 8 bytes = 64-bit full store.
-          io.mem.req.bits.size := 3.U
-
-          io.mem.req.bits.signed := false.B
-
-          // Pack four 16-bit outputs into one 64-bit word.
-          io.mem.req.bits.data := Cat(
-            outputBuf((storeIdx + 3.U)(9, 0)),
-            outputBuf((storeIdx + 2.U)(9, 0)),
-            outputBuf((storeIdx + 1.U)(9, 0)),
-            outputBuf(storeIdx(9, 0))
-          )
-
-          when(io.mem.req.valid && !io.mem.req.ready && watchStoreIdx) {
-            printf("[STORE_STALL] idx=%d addr=%x\n",
-              storeIdx,
-              outputAddrReg + (storeIdx << 1)
-            )
-          }
-
-          when(io.mem.req.fire) {
-            memInflight := true.B
-
-            when(watchStoreIdx) {
-              printf("[STORE_REQ] idx=%d addr=%x data=%x out0=%x out1=%x out2=%x out3=%x\n",
-                storeIdx,
-                outputAddrReg + (storeIdx << 1),
-                io.mem.req.bits.data,
-                outputBuf(storeIdx(9, 0)),
-                outputBuf((storeIdx + 1.U)(9, 0)),
-                outputBuf((storeIdx + 2.U)(9, 0)),
-                outputBuf((storeIdx + 3.U)(9, 0))
-              )
-            }
-          }
-        }
-
-        when(memInflight && io.mem.resp.valid) {
-          memInflight := false.B
-
-          when(watchStoreIdx) {
-            printf("[STORE_RESP] idx=%d\n", storeIdx)
-          }
-
-          // Four 16-bit elements have now completed their store response.
-          storeIdx := storeIdx + 4.U
-        }
-
-      }.otherwise {
+      // Compatibility barrier.
+      // In this streaming design, output stores are issued during COMPUTE.
+      when(computedReg) {
         resultReg := RET_SUCCESS
-
-        printf("[MyConvAccel] STORE complete storeIdx=%d\n", storeIdx)
-
-        state := sRespond
+      }.otherwise {
+        resultReg := RET_ERROR
       }
+      state := sRespond
     }
 
     is(sRespond) {
       when(xdReg) {
         io.resp.valid := true.B
-
         when(io.resp.fire) {
-          printf("[MyConvAccel] RESP fire rd=%d data=%x\n", rdReg, resultReg)
           state := sIdle
         }
-
       }.otherwise {
-        printf("[MyConvAccel] RESP skipped because xd=0 data=%x\n", resultReg)
         state := sIdle
       }
     }
