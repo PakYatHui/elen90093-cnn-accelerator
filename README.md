@@ -7,172 +7,327 @@
 
 ## Project Overview
 
-This project implements a RISC-V RoCC-based CNN convolution accelerator for 32x32 matrix convolution.
+This repository implements a RISC-V RoCC-based CNN convolution accelerator for 32x32 matrix convolution in Chipyard.
 
-The accelerator started as a signed 16-bit fixed-point 8.8 convolution accelerator. The current development version extends the design with a cleaner command interface and a selectable data type path for both fixed-point 8.8 and IEEE-754 half-precision floating point (`Float16`).
+The `feature/streaming-sliding-pipeline` branch is the current streaming accelerator branch. It replaces the earlier full-image batch design with a window-based streaming pipeline using ping-pong buffers, FIFO queues, a RoCC memory scheduler, tag-based memory response routing, privilege propagation, scalar bias support, sliding-window reuse, and row-parallel MAC computation.
 
-The accelerator supports runtime kernel-size configuration for 1x1, 3x3, and 5x5 convolution kernels. It uses zero padding for boundary elements and communicates with the RISC-V core through a RoCC custom instruction interface.
-
-## Version and Status
-
-```text
-Version: v0.3 - Interface Refactor and Float16 Datapath Extension
-Branch: feature/accelerator-fsm
-Status: Updated command interface tested; Fixed16 path preserved; Float16 path added for validation
-```
-
-The current version focuses on two major updates:
-
-1. Refactoring the accelerator command interface from the old CONFIG / LOAD / COMPUTE / STORE model into a clearer CONFIG / KERNEL / DATA / COMPUTE / STORE model.
-2. Extending the internal datapath so the accelerator can select between fixed-point 8.8 and Float16 computation.
-
-The fixed-point path remains the baseline working path. The Float16 path has been added and should be validated further using different kernels and CNN-style workloads.
-
-## Supported Features
+The accelerator supports:
 
 - 32x32 input matrix
 - 32x32 output matrix
 - 1x1, 3x3, and 5x5 convolution kernels
-- Runtime kernel-size configuration
-- Runtime data-type configuration
-- Signed 16-bit fixed-point 8.8 data path
-- IEEE-754 half-precision Float16 data path
-- Zero padding for boundary elements
-- RoCC custom instruction interface
-- Success/error response through `rd`
-- Internal input buffer
-- Internal kernel buffer
-- Internal output buffer
-- Real memory load through `io.mem.req` and `io.mem.resp`
-- Real memory store through `io.mem.req` and `io.mem.resp`
-- 64-bit full-width stores to avoid TileLink PutPartial transactions
-- 25-term convolution datapath for maximum 5x5 kernels
-- Runtime masking for smaller kernels
-- Basic command-sequence checking
-- Bias interface registers prepared for later bias support
+- signed 16-bit fixed-point 8.8 mode
+- IEEE-754 half-precision Float16 mode
+- optional scalar bias
+- zero padding at image boundaries
+- RoCC custom instructions
 
-## Current Limitations
+---
 
-- Bias address and bias enable are exposed in the interface, but bias computation is not implemented yet.
-- If bias is enabled, the current design rejects the DATA command and returns an error.
-- Float16 computation has been added using HardFloat modules, but it needs more testing with non-identity kernels.
-- The current Float16 test is mainly a functional validation path, not a full CNN benchmark.
-- The accelerator currently targets one 32x32 input matrix and one output matrix.
-- Performance optimization is not the current focus; correctness and interface stability come first.
-
-## Major Updates in v0.3
-
-### Command interface refactor
-
-The old command sequence was:
+## Version and Status
 
 ```text
-CONFIG -> LOAD -> COMPUTE -> STORE
+Version: v0.5 - Streaming Sliding Pipeline with Row-Parallel MAC
+Branch: feature/streaming-sliding-pipeline
+Status: Fixed16 validated for 1x1, 3x3, and 5x5; Float16 path included and should be tested separately
 ```
 
-The new command sequence is:
+This branch is no longer the old batch-style accelerator. The current design uses a streaming pipeline:
 
 ```text
 CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE
 ```
 
-This separates the accelerator configuration into clearer categories:
+At a high level:
 
 ```text
-CONFIG = kernel size, data type, bias enable
-KERNEL = kernel weight address, bias address
-DATA   = input data address, output data address
+DATA:
+  preload kernel weights and optional scalar bias
+
+COMPUTE:
+  stream input windows
+  reuse sliding-window data
+  compute outputs
+  pack outputs into 64-bit stores
+  write results through the RoCC memory interface
+
+STORE:
+  compatibility command; most output stores are already issued during COMPUTE
 ```
 
-The DATA command replaces the old LOAD command at the software-interface level. Internally, the accelerator still reuses the existing load state to read input data and kernel weights into internal buffers.
+---
 
-### Data type extension
+## Main Design Difference from the Batch Version
 
-The accelerator now supports two data type modes:
+The earlier accelerator used large internal buffers:
 
 ```text
-DATA_FIXED16 = 0
-DATA_FLOAT16 = 1
+inputBuf[1024]
+outputBuf[1024]
+kernelBuf[25]
 ```
 
-The internal buffers were changed from signed 16-bit storage to raw 16-bit storage:
+That design loaded the full input image, computed the full output image, and then stored the full output image.
+
+The streaming branch removes the large full-image input and output buffers. It uses:
+
+```text
+kernelBuf[25]
+biasBuf[1]
+windowBuf0[25]
+windowBuf1[25]
+windowReadyQ
+outputQ
+tagTable
+```
+
+This means the accelerator only keeps the current and next convolution windows in registers. The pipeline is designed to reduce register pressure and allow load, compute, and store stages to overlap.
+
+---
+
+## Current Architecture
+
+### 1. RoCC Command Buffer
+
+The accelerator receives commands through:
 
 ```scala
-Reg(Vec(..., UInt(16.W)))
+val cmd = Queue(io.cmd, 1)
 ```
 
-This allows the same memory layout to hold either:
+This gives the RoCC command interface a small input buffer before the internal FSM decodes the command.
+
+### 2. FSM States
+
+The main FSM remains compatible with the previous branch:
 
 ```text
-fixed-point 8.8 raw bits
-Float16 raw bits
+sIdle
+sDecode
+sConfig
+sKernel
+sLoad
+sCompute
+sStore
+sRespond
 ```
 
-Fixed-point computation interprets the buffer values as signed 16-bit 8.8 values.
-
-Float16 computation interprets the buffer values as IEEE-754 half-precision values and uses HardFloat-based floating-point multiply/add logic.
-
-### Test update
-
-Two software tests are now maintained:
+The responsibility of each state has changed:
 
 ```text
-tests/software/conv_test.c
-tests/software/conv_float_test.c
+sConfig:
+  configure kernel size, data type, and bias enable
+
+sKernel:
+  record kernel address and bias address
+
+sLoad:
+  preload kernel weights and optional scalar bias
+
+sCompute:
+  run the streaming pipeline
+  load windows
+  perform sliding reuse
+  compute outputs
+  issue packed stores
+
+sStore:
+  return success after streaming computation has completed
 ```
 
-`conv_test.c` is the fixed-point 8.8 test.
+### 3. PIPO / Ping-Pong Window Buffers
 
-`conv_float_test.c` is the Float16 test using `uint16_t` raw half-precision values.
-
-## Main Accelerator File
-
-GitHub project file:
+The accelerator uses two 25-element window buffers:
 
 ```text
-src/main/chisel/ConvAccelerator.scala
+windowBuf0[25]
+windowBuf1[25]
 ```
 
-Chipyard compile location:
+The two buffers allow one window to be read by the compute stage while the other is written by the load stage.
+
+Each buffer has a state:
 
 ```text
-~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
+BUF_FREE
+BUF_LOADING
+BUF_READY
+BUF_COMPUTING
 ```
 
-The GitHub project file is used for version control. The Chipyard file is the one actually compiled by Chipyard.
+The state transition is:
 
-When testing the accelerator in Chipyard, copy the GitHub file into the Chipyard compile location:
-
-```bash
-cp ~/elen90093-cnn-accelerator/src/main/chisel/ConvAccelerator.scala \
-~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
+```text
+FREE -> LOADING -> READY -> COMPUTING -> FREE
 ```
+
+This prevents load/compute conflicts such as writing to a window buffer while compute is still reading it.
+
+### 4. FIFO Queues
+
+Two internal queues connect the pipeline stages:
+
+```text
+windowReadyQ
+outputQ
+```
+
+`windowReadyQ` holds metadata for a loaded window:
+
+```text
+buffer ID
+output index
+row
+column
+```
+
+`outputQ` holds packed output-store metadata:
+
+```text
+base output index
+64-bit packed output data
+```
+
+This allows the load, compute, and store stages to progress independently when possible.
+
+### 5. Sliding-Window Reuse
+
+Within each output row, the accelerator reuses the previous window when moving from column `col` to column `col + 1`.
+
+For a 5x5 kernel, instead of loading 25 input elements for every output pixel, the loader copies the reusable part of the previous window and only loads the new rightmost column.
+
+Conceptually:
+
+```text
+old window -> new window
+reuse K x (K - 1) elements
+load only K new elements
+```
+
+For example:
+
+```text
+3x3: load 3 new input values per horizontal step
+5x5: load 5 new input values per horizontal step
+```
+
+The first window of each row is still loaded as a full window.
+
+### 6. Row-Parallel MAC
+
+The older compute path accumulated one kernel element per cycle.
+
+This branch uses row-parallel MAC. One cycle consumes one kernel row:
+
+```text
+1x1: 1 cycle per output
+3x3: 3 cycles per output
+5x5: 5 cycles per output
+```
+
+For fixed16, each row computes multiple 8.8 fixed-point multiply-accumulate terms in parallel.
+
+For Float16, the row path uses HardFloat-based multiply and add logic on raw half-precision values.
+
+### 7. 64-bit Packed Output Store
+
+Four 16-bit output elements are packed into one 64-bit store word:
+
+```text
+output[col + 0]
+output[col + 1]
+output[col + 2]
+output[col + 3]
+```
+
+Then the accelerator issues one 64-bit `M_XWR` request.
+
+This reduces the number of store requests and avoids unnecessary partial-store transactions.
+
+### 8. RoCC Memory Scheduler
+
+RoCC exposes one memory request port:
+
+```scala
+io.mem.req
+```
+
+A cycle can issue either a read or a write, not both.
+
+The streaming branch uses a scheduler to arbitrate between:
+
+```text
+window load read requests
+output store write requests
+```
+
+The scheduler also checks that a free tag is available before issuing a new request.
+
+### 9. Tag Table
+
+The accelerator supports multiple inflight memory requests using a tag table:
+
+```text
+tagValid
+tagType
+tagBufId
+tagElemIdx
+tagElemCount
+tagOutIdx
+```
+
+The tag table is needed because memory responses must be routed back to the correct destination.
+
+Example:
+
+```text
+TAG_LOAD_WINDOW:
+  write response data into windowBuf[bufId][elemIdx]
+
+TAG_STORE_OUT:
+  store acknowledgement; free the tag
+```
+
+### 10. Privilege Propagation
+
+The accelerator latches the CPU data privilege level from the RoCC command:
+
+```scala
+dprvReg := cmd.bits.status.dprv
+```
+
+All RoCC memory requests use:
+
+```scala
+io.mem.req.bits.dprv := dprvReg
+```
+
+This is required so accelerator memory accesses follow the same privilege and protection rules as the CPU data access that launched the command sequence.
+
+---
 
 ## Custom Instruction Interface
 
-The accelerator uses the `funct7` field to select commands.
+The accelerator uses `funct7` to select commands.
 
 ### CONFIG
 
 ```text
 funct7 = 0
-Command = CONFIG
 rs1 = kernel size
 rs2 = config flags
 rd  = 1 for success, 0 for error
 ```
 
-The CONFIG command sets the convolution mode.
-
-`rs1` selects the kernel size:
+Kernel size:
 
 ```text
-1 = 1x1 kernel
-3 = 3x3 kernel
-5 = 5x5 kernel
+1 = 1x1
+3 = 3x3
+5 = 5x5
 ```
 
-`rs2` stores config flags:
+Config flags:
 
 ```text
 rs2[1:0] = data type
@@ -190,60 +345,37 @@ Data type encoding:
 
 ```text
 funct7 = 4
-Command = KERNEL
 rs1 = kernel weight address
 rs2 = bias address
 rd  = 1 for success, 0 for error
 ```
 
-The KERNEL command stores the kernel weight address and bias address.
-
-The bias address is recorded for future use. Bias computation is not currently active.
-
 ### DATA
 
 ```text
 funct7 = 1
-Command = DATA
-rs1 = input data address
-rs2 = output data address
+rs1 = input matrix address
+rs2 = output matrix address
 rd  = 1 for success, 0 for error
-```
-
-The DATA command sets the input and output matrix addresses.
-
-After the DATA command is accepted, the accelerator enters its internal memory-load state and reads:
-
-```text
-input matrix data
-kernel weight data
 ```
 
 ### COMPUTE
 
 ```text
 funct7 = 2
-Command = COMPUTE
 rs1 = unused
 rs2 = unused
 rd  = 1 for success, 0 for error
 ```
-
-The COMPUTE command runs convolution using the selected data type.
 
 ### STORE
 
 ```text
 funct7 = 3
-Command = STORE
 rs1 = unused
 rs2 = unused
 rd  = 1 for success, 0 for error
 ```
-
-The STORE command writes the output matrix back to memory.
-
-## Required Command Order
 
 The required command order is:
 
@@ -255,79 +387,123 @@ conv_compute();
 conv_store();
 ```
 
-For fixed-point 8.8 without bias:
+---
 
-```c
-conv_config(kernel_size, CONFIG_FLAGS(DATA_FIXED16, 0));
-conv_kernel(kernel_buf, 0);
-conv_data(input_buf, hw_output);
-conv_compute();
-conv_store();
-```
+## Data Formats
 
-For Float16 without bias:
+### Fixed16
 
-```c
-conv_config(kernel_size, CONFIG_FLAGS(DATA_FLOAT16, 0));
-conv_kernel(kernel_buf, 0);
-conv_data(input_buf, hw_output);
-conv_compute();
-conv_store();
-```
-
-The software wrappers use RoCC macros with destination-register support:
+Fixed16 uses signed 16-bit 8.8 fixed-point format.
 
 ```text
-CONFIG  -> ROCC_INSTRUCTION_DSS
-KERNEL  -> ROCC_INSTRUCTION_DSS
-DATA    -> ROCC_INSTRUCTION_DSS
-COMPUTE -> ROCC_INSTRUCTION_D
-STORE   -> ROCC_INSTRUCTION_D
+real value = raw int16 / 256
 ```
 
-This ensures that the custom instruction sets `xd = 1` when a response through `rd` is expected.
+MAC scaling:
+
+```text
+product = input * kernel
+scaled  = product >> 8
+sum    += scaled
+output  = sum + bias
+```
+
+### Float16
+
+Float16 stores IEEE-754 half-precision raw bits in `uint16_t` / `UInt(16.W)`.
+
+The hardware path uses HardFloat modules for half-precision multiply and add.
+
+---
+
+## Bias Support
+
+This branch implements real scalar bias support.
+
+When bias is enabled:
+
+```text
+CONFIG rs2[2] = 1
+KERNEL rs2 = bias address
+```
+
+The accelerator loads one 16-bit scalar bias value and adds it to every output pixel.
+
+For fixed16, the bias is interpreted as 8.8 fixed-point.
+
+For Float16, the bias is interpreted as raw half-precision bits.
+
+---
 
 ## Software Tests
 
-### Fixed-point functional test
+The standard test files are:
 
 ```text
 tests/software/conv_test.c
-```
-
-This test:
-
-- initializes 32x32 fixed-point 8.8 input data
-- configures the accelerator for `DATA_FIXED16`
-- sets the kernel address through the KERNEL command
-- sets input and output addresses through the DATA command
-- runs hardware convolution
-- stores accelerator output back to memory
-- computes a CPU software reference result
-- compares all 1024 output elements
-- tests 1x1, 3x3, and 5x5 kernels
-- reports hardware and software cycle counts
-
-### Float16 functional test
-
-```text
 tests/software/conv_float_test.c
 ```
 
-This test:
+The fixed16 test should validate:
 
-- stores Float16 values as raw `uint16_t` bits
-- configures the accelerator for `DATA_FLOAT16`
-- uses the CONFIG / KERNEL / DATA / COMPUTE / STORE command sequence
-- runs 1x1, 3x3, and 5x5 identity-style convolution tests
-- computes a CPU-side reference using Float32 helper conversion and half-precision rounding helpers
-- compares hardware and software raw Float16 output bits
+```text
+1x1 no bias
+3x3 no bias
+5x5 no bias
+1x1 with bias
+3x3 with bias
+5x5 with bias
+```
 
-The Float16 test should be expanded with more kernels and edge cases before being treated as complete CNN validation.
+The Float16 test should validate:
+
+```text
+1x1 no bias
+3x3 no bias
+5x5 no bias
+1x1 with bias
+3x3 with bias
+5x5 with bias
+```
+
+The tests compare all 1024 output elements against a CPU reference and print hardware and software cycle counts.
+
+---
+
+## Measured Fixed16 Performance Example
+
+One tested fixed16 no-bias run produced:
+
+```text
+1x1:  5513 cycles
+3x3:  9792 cycles
+5x5: 14185 cycles
+```
+
+The 5x5 case is significantly faster than the earlier single-MAC streaming version because row-parallel MAC reduces compute work from 25 cycles per output to 5 cycles per output.
+
+Exact cycle counts may vary with test code, simulator configuration, branch contents, and whether debug printing is enabled.
+
+---
 
 ## Build and Run Instructions
 
-### Compile the fixed-point test
+### Copy Accelerator into Chipyard
+
+```bash
+cp ~/elen90093-cnn-accelerator/src/main/chisel/ConvAccelerator.scala \
+~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
+```
+
+### Build Simulator
+
+```bash
+cd ~/chipyard/sims/verilator
+make clean CONFIG=MyConvAccelConfig
+make CONFIG=MyConvAccelConfig
+```
+
+### Compile Fixed16 Test
 
 ```bash
 cd ~/elen90093-cnn-accelerator/tests/software
@@ -347,7 +523,7 @@ riscv64-unknown-elf-gcc \
   -o conv_test.riscv
 ```
 
-### Compile the Float16 test
+### Compile Float16 Test
 
 ```bash
 cd ~/elen90093-cnn-accelerator/tests/software
@@ -367,89 +543,150 @@ riscv64-unknown-elf-gcc \
   -o conv_float_test.riscv
 ```
 
-### Copy the accelerator into Chipyard
-
-```bash
-cp ~/elen90093-cnn-accelerator/src/main/chisel/ConvAccelerator.scala \
-~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
-```
-
-### Build the Chipyard simulator
+### Run Fixed16 Test
 
 ```bash
 cd ~/chipyard/sims/verilator
 
-make clean CONFIG=MyConvAccelConfig
-make CONFIG=MyConvAccelConfig
-```
-
-### Run the fixed-point test
-
-```bash
-cd ~/chipyard/sims/verilator && \
 make CONFIG=MyConvAccelConfig \
   run-binary \
   BINARY=~/elen90093-cnn-accelerator/tests/software/conv_test.riscv \
   TIMEOUT_CYCLES=100000000
 ```
 
-### Run the Float16 test
+### Run Float16 Test
 
 ```bash
-cd ~/chipyard/sims/verilator && \
+cd ~/chipyard/sims/verilator
+
 make CONFIG=MyConvAccelConfig \
   run-binary \
   BINARY=~/elen90093-cnn-accelerator/tests/software/conv_float_test.riscv \
   TIMEOUT_CYCLES=100000000
 ```
 
-`TIMEOUT_CYCLES=100000000` is used because the 5x5 software reference and Verilator simulation can take a long time.
+---
+
+## Debugging Notes
+
+Useful debug points:
+
+```text
+CONFIG accepted/rejected
+KERNEL accepted/rejected
+DATA accepted/rejected
+window load request
+window load response
+tag allocation
+tag release
+windowReadyQ enqueue/dequeue
+outputQ enqueue/dequeue
+store request
+store response
+compute start
+compute done
+```
+
+Common failure modes:
+
+```text
+SimpleHellaCacheIF exception:
+  usually caused by unaligned 64-bit memory access
+
+5x5 mismatch only:
+  likely window index, padding, or sliding-copy bug
+
+store mismatch every 4 outputs:
+  likely 64-bit output packing order issue
+
+hang in COMPUTE:
+  likely tag leak, queue full/empty deadlock, or buffer state not released
+```
+
+---
+
+## Current Limitations
+
+- The pipeline still processes one output at a time internally, although four outputs are packed for store.
+- The next major optimization is a 4-output tile pipeline.
+- The PIPO window buffers use 25 elements each, matching the maximum 5x5 window.
+- The design is optimized for a fixed 32x32 input and output shape.
+- Float16 is supported but has higher hardware cost because it uses HardFloat units.
+- More non-identity kernels and random tests should be added before final reporting.
+
+---
+
+## Next Optimization Direction
+
+The next performance step is to move from:
+
+```text
+1 pipeline task = 1 output pixel
+```
+
+to:
+
+```text
+1 pipeline task = 4 adjacent output pixels
+```
+
+This would allow the accelerator to compute four adjacent outputs, pack them into one 64-bit word, and store them with one memory request.
+
+For 5x5 convolution, a 4-output tile needs a maximum input tile of:
+
+```text
+5 rows x 8 columns = 40 input values
+```
+
+This increases the window buffer size but reduces per-output queue, scheduler, and store overhead.
+
+Expected next-step design:
+
+```text
+tileBuf0[40]
+tileBuf1[40]
+4 fixed16 accumulators
+4 output values packed into one 64-bit store
+```
+
+This is the recommended next branch after `feature/streaming-sliding-pipeline`.
+
+---
 
 ## Repository Structure
 
 ```text
 src/      Chisel and Scala source code for the accelerator
 tests/    Software and hardware tests
-docs/     Project notes, setup instructions, and accelerator documentation
+docs/     Project notes and setup instructions
 reports/  Report materials and figures
 scripts/  Helper scripts
 ```
 
-## Next Steps
+---
 
-The next stage of the project should focus on two areas.
+## Key File Locations
 
-### 1. Find suitable CNN algorithms for this accelerator
+GitHub source:
 
-The current accelerator is best suited for small convolution workloads with 1x1, 3x3, or 5x5 kernels on a 32x32 input matrix.
+```text
+src/main/chisel/ConvAccelerator.scala
+```
 
-The next task is to identify CNN algorithms or layers that match this hardware structure. Good candidates include:
+Chipyard compile target:
 
-- simple image filtering layers
-- edge detection kernels
-- small CNN convolution layers
-- LeNet-style early convolution layers
-- lightweight 3x3 convolution workloads
-- 1x1 pointwise convolution workloads
+```text
+~/chipyard/generators/myaccelerators/src/main/scala/ConvAccelerator.scala
+```
 
-The goal is to choose an algorithm that can clearly demonstrate why the custom accelerator is useful.
+Fixed16 test:
 
-### 2. Write different tests
+```text
+tests/software/conv_test.c
+```
 
-The current tests mainly use identity-style kernels. More tests are needed to validate the accelerator more realistically.
+Float16 test:
 
-Recommended new tests:
-
-- non-identity 3x3 kernel test
-- non-identity 5x5 kernel test
-- negative-value fixed-point test
-- negative-value Float16 test
-- mixed positive and negative kernel test
-- zero-padding boundary test
-- all-zero kernel test
-- all-one kernel test
-- random small-value input and kernel test
-- CPU reference comparison for each test
-- cycle-count comparison for fixed16 and Float16 modes
-
-These tests should be added before final evaluation and report writing.
+```text
+tests/software/conv_float_test.c
+```
