@@ -9,18 +9,24 @@ import freechips.rocketchip.tile._
 import freechips.rocketchip.rocket._
 
 // =============================================================================
-// Phase 2 fixed16 shared 2D tile buffer accelerator.
+// Phase 4B fixed16 vertical sliding-reuse accelerator.
 // Interface remains CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE.
 //
-// This version deliberately mirrors the working feature/accelerator-fsm store path:
-//   - COMPUTE only fills an internal outputBuf.
-//   - STORE performs the 64-bit packed M_XWR writes in a separate sStore state.
-//   - The 2D tileBuf is retained for shared input reuse.
+// Based on the Phase 4A PASS checkpoint:
+//   - 2D shared tileBuf is retained.
+//   - FSM-branch style STORE path is retained.
 //   - tileWidth uses +& so 5x5 gets width 8, not truncated to 0.
+//
+// New in Phase 4B:
+//   - Tile traversal is changed from row-major to column-block-major.
+//   - For tiles after the first output row in the same 4-column block, tileBuf
+//     reuses the overlapping lower rows from the previous tile.
+//   - Only the new bottom input row is loaded from memory.
+//   - No wide load, no float16, no change to the software interface.
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 2 2D tileBuf with FSM-branch store path version")
+  println("DEBUG: Elaborating MyConvAccel Phase 4B vertical sliding reuse version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -28,14 +34,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   extends LazyRoCCModuleImp(outer)
   with HasCoreParameters {
 
-  // ---------------------------------------------------------------------------
-  // External RoCC command interface
-  // ---------------------------------------------------------------------------
   val cmd = Queue(io.cmd, 1)
 
-  // ---------------------------------------------------------------------------
-  // Fixed design parameters
-  // ---------------------------------------------------------------------------
   val INPUT_SIZE       = 32
   val INPUT_ELEMS      = INPUT_SIZE * INPUT_SIZE
 
@@ -43,39 +43,30 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val MAX_KERNEL_ELEMS = MAX_KERNEL_SIZE * MAX_KERNEL_SIZE
 
   val TILE_OUTPUTS     = 4
-  val MAX_TILE_WIDTH   = MAX_KERNEL_SIZE + TILE_OUTPUTS - 1 // 8 for 5x5.
-  val MAX_TILE_ELEMS   = MAX_KERNEL_SIZE * MAX_TILE_WIDTH   // 40 for 5x5.
+  val MAX_TILE_WIDTH   = MAX_KERNEL_SIZE + TILE_OUTPUTS - 1
+  val MAX_TILE_ELEMS   = MAX_KERNEL_SIZE * MAX_TILE_WIDTH
 
-  // Return values
   val RET_ERROR   = 0.U(xLen.W)
   val RET_SUCCESS = 1.U(xLen.W)
 
-  // Data type encoding
   val DATA_FIXED16 = 0.U(2.W)
   val DATA_FLOAT16 = 1.U(2.W)
 
-  // funct7 encoding
   val FUNCT_CONFIG  = 0.U(7.W)
   val FUNCT_DATA    = 1.U(7.W)
   val FUNCT_COMPUTE = 2.U(7.W)
   val FUNCT_STORE   = 3.U(7.W)
   val FUNCT_KERNEL  = 4.U(7.W)
 
-  // Kernel/bias preload type
   val PRELOAD_KERNEL = 0.U(1.W)
   val PRELOAD_BIAS   = 1.U(1.W)
 
-  // Main FSM states
   val sIdle :: sDecode :: sConfig :: sKernel :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
-  // Fixed16 shared tile engine states
-  val ftIdle :: ftLoadTile :: ftLoadWait :: ftCompute :: ftStore :: ftStoreWait :: ftDone :: Nil = Enum(7)
+  val ftIdle :: ftReuseRows :: ftLoadTile :: ftLoadWait :: ftCompute :: ftStore :: ftStoreWait :: ftDone :: Nil = Enum(8)
   val fixedTileState = RegInit(ftIdle)
 
-  // ---------------------------------------------------------------------------
-  // Latched command fields
-  // ---------------------------------------------------------------------------
   val functReg = RegInit(0.U(7.W))
   val rs1Reg   = RegInit(0.U(xLen.W))
   val rs2Reg   = RegInit(0.U(xLen.W))
@@ -83,9 +74,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val dprvReg  = RegInit(0.U(2.W))
   val xdReg    = RegInit(false.B)
 
-  // ---------------------------------------------------------------------------
-  // Runtime configuration registers
-  // ---------------------------------------------------------------------------
   val inputAddrReg   = RegInit(0.U(xLen.W))
   val kernelAddrReg  = RegInit(0.U(xLen.W))
   val outputAddrReg  = RegInit(0.U(xLen.W))
@@ -95,62 +83,43 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val dataTypeReg    = RegInit(DATA_FIXED16)
   val biasEnableReg  = RegInit(false.B)
 
-  // Command sequence protection flags
   val configuredReg       = RegInit(false.B)
   val kernelConfiguredReg = RegInit(false.B)
   val loadedReg           = RegInit(false.B)
   val computedReg         = RegInit(false.B)
 
-  // Response register
   val resultReg = RegInit(RET_ERROR)
 
-  // ---------------------------------------------------------------------------
-  // Kernel, bias, and shared tile storage
-  // ---------------------------------------------------------------------------
   val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
   val outputBuf = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
   val biasBuf   = RegInit(0.U(16.W))
 
-  // 2D shared tile buffer:
-  //   rows = kernelSize
-  //   cols = kernelSize + TILE_OUTPUTS - 1
-  //
-  // For 5x5 and four output lanes, the tile is 5 x 8 = 40 input values.
-  // Output lane o uses tileBuf(kr)(kc + o).
   val tileBuf = Reg(Vec(MAX_KERNEL_SIZE, Vec(MAX_TILE_WIDTH, UInt(16.W))))
 
-  // ---------------------------------------------------------------------------
-  // Kernel/bias preload bookkeeping
-  // ---------------------------------------------------------------------------
   val preloadIdx      = RegInit(0.U(6.W))
   val preloadInflight = RegInit(false.B)
   val preloadType     = RegInit(PRELOAD_KERNEL)
   val biasLoadedReg   = RegInit(true.B)
 
-  // ---------------------------------------------------------------------------
-  // Shared tile engine bookkeeping
-  // ---------------------------------------------------------------------------
-  val tileBaseIdx = RegInit(0.U(11.W))
+  // Tile traversal is column-block-major for vertical reuse:
+  //   col block 0: rows 0..31, then col block 4: rows 0..31, etc.
+  val tileBaseRowReg = RegInit(0.U(6.W))
+  val tileBaseColReg = RegInit(0.U(6.W))
 
-  // Loader cursor. 5x5 needs 40 elements, so tileLoadCnt must be 6 bits.
   val tileLoadRow = RegInit(0.U(3.W))
   val tileLoadCol = RegInit(0.U(4.W))
   val tileLoadCnt = RegInit(0.U(6.W))
 
-  // Compute cursor. One kernel row is consumed per compute cycle.
+  val tileReuseActiveReg = RegInit(false.B)
+
   val tileMacRow = RegInit(0.U(3.W))
 
   val tileAcc    = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.S(40.W))))
   val tileOutReg = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
 
-  // Store bookkeeping. This intentionally follows the working FSM branch:
-  // compute fills outputBuf first, then STORE writes outputBuf to memory.
   val storeIdx      = RegInit(0.U(11.W))
   val storeInflight = RegInit(false.B)
 
-  // ---------------------------------------------------------------------------
-  // Command decode helper wires
-  // ---------------------------------------------------------------------------
   val doConfig  = functReg === FUNCT_CONFIG
   val doData    = functReg === FUNCT_DATA
   val doCompute = functReg === FUNCT_COMPUTE
@@ -160,12 +129,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val validKernelSize =
     (rs1Reg === 1.U) || (rs1Reg === 3.U) || (rs1Reg === 5.U)
 
-  // This Phase 2 debug version is fixed16-only.
   val validDataType = rs2Reg(1, 0) === DATA_FIXED16
 
-  // ---------------------------------------------------------------------------
-  // Default IO assignments
-  // ---------------------------------------------------------------------------
   cmd.ready := false.B
 
   io.resp.valid := false.B
@@ -185,19 +150,27 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.data := 0.U
   io.mem.req.bits.dprv := dprvReg
 
-  // ---------------------------------------------------------------------------
-  // Tile geometry and loader address generation
-  // ---------------------------------------------------------------------------
   val tileRadius  = kernelSizeReg >> 1
-  val tileBaseRow = tileBaseIdx(9, 5)
-  val tileBaseCol = tileBaseIdx(4, 0)
+  val tileBaseRow = tileBaseRowReg
+  val tileBaseCol = tileBaseColReg
 
-  // tileWidth = kernelSize + 3.
-  // Use +& so 5 + 3 becomes 8, not 3-bit truncated zero.
+  val tileOutBaseIdx = (tileBaseRowReg << 5) + tileBaseColReg
+
   val tileWidth = kernelSizeReg +& (TILE_OUTPUTS - 1).U(3.W)
-
-  // Maximum runtime tileElems is 5 * 8 = 40, which fits in 6 bits.
   val tileElems = (kernelSizeReg * tileWidth)(5, 0)
+
+  val tileReuseStartRow = Wire(UInt(3.W))
+  tileReuseStartRow := kernelSizeReg - 1.U
+
+  val tileLoadStartRow = Mux(tileReuseActiveReg, tileReuseStartRow, 0.U(3.W))
+
+  val tileLoadDone = Mux(
+    tileReuseActiveReg,
+    tileLoadRow >= kernelSizeReg,
+    tileLoadCnt >= tileElems
+  )
+
+  val tileCanReuseVert = tileBaseRowReg =/= 0.U
 
   val tileLoadInRowS =
     tileBaseRow.zext + tileLoadRow.zext - tileRadius.zext
@@ -212,9 +185,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val tileLoadMemIndex = (tileLoadInRowS.asUInt << 5) + tileLoadInColS.asUInt
   val tileLoadMemAddr  = inputAddrReg + (tileLoadMemIndex << 1)
 
-  // ---------------------------------------------------------------------------
-  // Compute datapath
-  // ---------------------------------------------------------------------------
   val biasTerm = Wire(SInt(40.W))
   biasTerm := Mux(biasEnableReg, biasBuf.asSInt, 0.S(40.W))
 
@@ -225,11 +195,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   for (o <- 0 until TILE_OUTPUTS) {
     for (kc <- 0 until MAX_KERNEL_SIZE) {
       val validKc = kc.U < kernelSizeReg
-
-      // For output lane o, the input column is kc + o.
-      // The largest value is 4 + 3 = 7, so 3 bits are enough for the final Vec index.
       val tileCol = (kc + o).U(4.W)
-
       val kernelElem = ((tileMacRow * kernelSizeReg) +& kc.U(3.W))(4, 0)
 
       val inVal  = tileBuf(tileMacRow)(tileCol(2, 0)).asSInt
@@ -250,11 +216,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   val tileStoreData = Cat(tileOutReg(3), tileOutReg(2), tileOutReg(1), tileOutReg(0))
 
-  // ---------------------------------------------------------------------------
-  // Helper methods
-  // ---------------------------------------------------------------------------
-  def resetTileLoadCursors(): Unit = {
-    tileLoadRow := 0.U
+  def resetTileLoadCursors(startRow: UInt): Unit = {
+    tileLoadRow := startRow
     tileLoadCol := 0.U
     tileLoadCnt := 0.U
   }
@@ -282,9 +245,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Main FSM
-  // ---------------------------------------------------------------------------
   switch(state) {
 
     is(sIdle) {
@@ -334,8 +294,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
       }.elsewhen(doCompute) {
         when(configuredReg && kernelConfiguredReg && loadedReg && dataTypeReg === DATA_FIXED16) {
-          tileBaseIdx := 0.U
-          resetTileLoadCursors()
+          tileBaseRowReg := 0.U
+          tileBaseColReg := 0.U
+          tileReuseActiveReg := false.B
+          resetTileLoadCursors(0.U)
           resetTileComputeCursors()
           resetTileAccumulators()
 
@@ -412,7 +374,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sLoad) {
-      // DATA stage preloads only kernel weights and optional scalar bias.
       when(!preloadInflight) {
         when(preloadIdx < kernelElemsReg) {
           io.mem.req.valid := true.B
@@ -467,21 +428,43 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       switch(fixedTileState) {
 
         is(ftIdle) {
-          when(tileBaseIdx >= INPUT_ELEMS.U) {
+          when(tileBaseColReg >= INPUT_SIZE.U) {
             computedReg := true.B
             resultReg := RET_SUCCESS
             fixedTileState := ftDone
             state := sRespond
           }.otherwise {
-            resetTileLoadCursors()
             resetTileComputeCursors()
             resetTileAccumulators()
-            fixedTileState := ftLoadTile
+
+            when(tileCanReuseVert) {
+              tileReuseActiveReg := true.B
+              fixedTileState := ftReuseRows
+            }.otherwise {
+              tileReuseActiveReg := false.B
+              resetTileLoadCursors(0.U)
+              fixedTileState := ftLoadTile
+            }
           }
         }
 
+        is(ftReuseRows) {
+          // Reuse the overlapping rows from the previous output row in the
+          // same 4-column block: new row 0 gets old row 1, etc.
+          for (r <- 0 until (MAX_KERNEL_SIZE - 1)) {
+            for (c <- 0 until MAX_TILE_WIDTH) {
+              when(r.U < (kernelSizeReg - 1.U) && c.U < tileWidth) {
+                tileBuf(r)(c) := tileBuf(r + 1)(c)
+              }
+            }
+          }
+
+          resetTileLoadCursors(tileReuseStartRow)
+          fixedTileState := ftLoadTile
+        }
+
         is(ftLoadTile) {
-          when(tileLoadCnt >= tileElems) {
+          when(tileLoadDone) {
             resetTileComputeCursors()
             fixedTileState := ftCompute
 
@@ -517,12 +500,16 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             for (i <- 0 until TILE_OUTPUTS) {
               val finalOut = (tileNextAcc(i) + biasTerm).asUInt(15, 0)
               tileOutReg(i) := finalOut
-              outputBuf((tileBaseIdx + i.U)(9, 0)) := finalOut
+              outputBuf((tileOutBaseIdx + i.U)(9, 0)) := finalOut
             }
 
-            // Do not write memory here. The working FSM branch writes output
-            // memory only from sStore after COMPUTE has completed.
-            tileBaseIdx := tileBaseIdx + TILE_OUTPUTS.U
+            when(tileBaseRowReg === (INPUT_SIZE - 1).U) {
+              tileBaseRowReg := 0.U
+              tileBaseColReg := tileBaseColReg + TILE_OUTPUTS.U
+            }.otherwise {
+              tileBaseRowReg := tileBaseRowReg + 1.U
+            }
+
             fixedTileState := ftIdle
 
           }.otherwise {
@@ -535,12 +522,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         }
 
         is(ftStore) {
-          // Unused in this FSM-branch-store version.
           fixedTileState := ftIdle
         }
 
         is(ftStoreWait) {
-          // Unused in this FSM-branch-store version.
           fixedTileState := ftIdle
         }
 
@@ -553,8 +538,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sStore) {
-      // Store path mirrors the working feature/accelerator-fsm branch:
-      // one aligned 64-bit M_XWR writes four packed 16-bit output elements.
       when(storeIdx < INPUT_ELEMS.U) {
         when(!storeInflight) {
           io.mem.req.valid := true.B
