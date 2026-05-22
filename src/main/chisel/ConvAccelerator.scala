@@ -9,7 +9,7 @@ import freechips.rocketchip.tile._
 import freechips.rocketchip.rocket._
 
 // =============================================================================
-// Phase 5A fixed16 safe wide-load accelerator.
+// Phase 5B fixed16 partial-tail wide-load accelerator.
 // Interface remains CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE.
 //
 // Based on the Phase 4B PASS checkpoint:
@@ -17,7 +17,7 @@ import freechips.rocketchip.rocket._
 //   - Vertical sliding reuse is retained.
 //   - FSM-branch style STORE path is retained.
 //
-// New in Phase 5A:
+// New in Phase 5B:
 //   - Opportunistic 64-bit input loads for tile rows.
 //   - A wide load is used only when four consecutive int16 input values are
 //     all inside the image and the byte address is 8-byte aligned.
@@ -26,7 +26,7 @@ import freechips.rocketchip.rocket._
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 5A safe wide input load version")
+  println("DEBUG: Elaborating MyConvAccel Phase 5B partial-tail wide input load version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -113,8 +113,12 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val tileReuseActiveReg = RegInit(false.B)
 
   // Tracks whether the outstanding input tile load was a 64-bit load.
-  // Scalar loads write one tileBuf element; wide loads write four adjacent elements.
+  // Scalar loads write one tileBuf element; wide loads write up to four adjacent elements.
   val tileLoadWideReg = RegInit(false.B)
+
+  // Number of useful halfwords returned by the outstanding wide load.
+  // This can be less than four for tail columns at the end of a tile row.
+  val tileLoadWideCountReg = RegInit(0.U(3.W))
 
   val tileMacRow = RegInit(0.U(3.W))
 
@@ -189,14 +193,28 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val tileLoadMemIndex = (tileLoadInRowS.asUInt << 5) + tileLoadInColS.asUInt
   val tileLoadMemAddr  = inputAddrReg + (tileLoadMemIndex << 1)
 
+  // Number of runtime tile columns remaining in the current tile row.
+  val tileLoadColsRemaining = tileWidth - tileLoadCol
+
+  val tileLoadWideCount = Mux(
+    tileLoadColsRemaining >= 4.U,
+    4.U(3.W),
+    tileLoadColsRemaining(2, 0)
+  )
+
   // Safe wide-load condition:
   //   - current element is valid,
-  //   - four consecutive tile columns fit inside the runtime tile width,
+  //   - at least one tile column remains,
   //   - four consecutive image columns fit inside the 32-wide input row,
   //   - the starting image column is a multiple of four, so the byte address is 8-byte aligned.
+  //
+  // Unlike Phase 5A, this version does not require four tile columns to remain.
+  // At the tail of a tile row it still performs one aligned 64-bit read but only
+  // commits the useful returned halfwords to tileBuf.
   val tileLoadCanWide =
     tileLoadInputValid &&
-    ((tileLoadCol + 3.U) < tileWidth) &&
+    (tileLoadCol < tileWidth) &&
+    (tileLoadWideCount =/= 0.U) &&
     (tileLoadInColS >= 0.S) &&
     (tileLoadInColS <= (INPUT_SIZE - 4).S) &&
     (tileLoadInColS.asUInt(1, 0) === 0.U)
@@ -261,15 +279,15 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
   }
 
-  def advanceTileLoadCursorBy4(): Unit = {
-    tileLoadCnt := tileLoadCnt + 4.U
+  def advanceTileLoadCursorByN(step: UInt): Unit = {
+    tileLoadCnt := tileLoadCnt + step
 
-    val nextCol = tileLoadCol + 4.U
+    val nextCol = tileLoadCol +& step
     when(nextCol >= tileWidth) {
       tileLoadCol := 0.U
       tileLoadRow := tileLoadRow + 1.U
     }.otherwise {
-      tileLoadCol := nextCol
+      tileLoadCol := nextCol(3, 0)
     }
   }
 
@@ -326,6 +344,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           tileBaseColReg := 0.U
           tileReuseActiveReg := false.B
           tileLoadWideReg := false.B
+          tileLoadWideCountReg := 0.U(3.W)
           resetTileLoadCursors(0.U)
           resetTileComputeCursors()
           resetTileAccumulators()
@@ -469,10 +488,12 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             when(tileCanReuseVert) {
               tileReuseActiveReg := true.B
               tileLoadWideReg := false.B
+              tileLoadWideCountReg := 0.U(3.W)
               fixedTileState := ftReuseRows
             }.otherwise {
               tileReuseActiveReg := false.B
               tileLoadWideReg := false.B
+              tileLoadWideCountReg := 0.U(3.W)
               resetTileLoadCursors(0.U)
               fixedTileState := ftLoadTile
             }
@@ -491,6 +512,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           }
 
           tileLoadWideReg := false.B
+          tileLoadWideCountReg := 0.U(3.W)
           resetTileLoadCursors(tileReuseStartRow)
           fixedTileState := ftLoadTile
         }
@@ -515,6 +537,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
             when(io.mem.req.fire) {
               tileLoadWideReg := tileLoadCanWide
+              tileLoadWideCountReg := Mux(tileLoadCanWide, tileLoadWideCount, 0.U(3.W))
               fixedTileState := ftLoadWait
             }
           }
@@ -524,16 +547,27 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           when(io.mem.resp.valid) {
             when(tileLoadWideReg) {
               tileBuf(tileLoadRow)(tileLoadCol(2, 0)) := io.mem.resp.bits.data(15, 0)
-              tileBuf(tileLoadRow)((tileLoadCol + 1.U)(2, 0)) := io.mem.resp.bits.data(31, 16)
-              tileBuf(tileLoadRow)((tileLoadCol + 2.U)(2, 0)) := io.mem.resp.bits.data(47, 32)
-              tileBuf(tileLoadRow)((tileLoadCol + 3.U)(2, 0)) := io.mem.resp.bits.data(63, 48)
-              advanceTileLoadCursorBy4()
+
+              when(tileLoadWideCountReg >= 2.U) {
+                tileBuf(tileLoadRow)((tileLoadCol + 1.U)(2, 0)) := io.mem.resp.bits.data(31, 16)
+              }
+
+              when(tileLoadWideCountReg >= 3.U) {
+                tileBuf(tileLoadRow)((tileLoadCol + 2.U)(2, 0)) := io.mem.resp.bits.data(47, 32)
+              }
+
+              when(tileLoadWideCountReg >= 4.U) {
+                tileBuf(tileLoadRow)((tileLoadCol + 3.U)(2, 0)) := io.mem.resp.bits.data(63, 48)
+              }
+
+              advanceTileLoadCursorByN(tileLoadWideCountReg)
             }.otherwise {
               tileBuf(tileLoadRow)(tileLoadCol(2, 0)) := io.mem.resp.bits.data(15, 0)
               advanceTileLoadCursor()
             }
 
             tileLoadWideReg := false.B
+            tileLoadWideCountReg := 0.U(3.W)
             fixedTileState := ftLoadTile
           }
         }
