@@ -7,26 +7,26 @@ import org.chipsalliance.cde.config._
 import org.chipsalliance.diplomacy.lazymodule._
 import freechips.rocketchip.tile._
 import freechips.rocketchip.rocket._
+import hardfloat._
 
 // =============================================================================
-// Phase 5B fixed16 partial-tail wide-load accelerator.
-// Interface remains CONFIG -> KERNEL -> DATA -> COMPUTE -> STORE.
+// Phase 6B accelerator.
+// Fixed16 path:
+//   - Keeps the Phase 5B optimized tile path.
+//   - 2D shared tileBuf.
+//   - Vertical sliding reuse.
+//   - Safe partial-tail 64-bit input loads.
+//   - 4-output packed store.
 //
-// Based on the Phase 4B PASS checkpoint:
-//   - 2D shared tileBuf is retained.
-//   - Vertical sliding reuse is retained.
-//   - FSM-branch style STORE path is retained.
-//
-// New in Phase 5B:
-//   - Opportunistic 64-bit input loads for tile rows.
-//   - A wide load is used only when four consecutive int16 input values are
-//     all inside the image and the byte address is 8-byte aligned.
-//   - Padding edges and unaligned positions fall back to the scalar 16-bit path.
-//   - No float16 and no software interface change.
+// Float16 path:
+//   - Uses the same Phase 5B tile traversal, tileBuf loading, reuse, and store.
+//   - Adds a 4-output row-MAC datapath using HardFloat.
+//   - Uses raw FP16 -> recFN -> HardFloat op -> raw FP16 conversion.
+//   - Accumulates each kernel row with a left-fold fp16 add chain.
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 5B partial-tail wide input load version")
+  println("DEBUG: Elaborating MyConvAccel Phase 6B tile HardFloat row-MAC version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -51,6 +51,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   val DATA_FIXED16 = 0.U(2.W)
   val DATA_FLOAT16 = 1.U(2.W)
+
+  val FP16_EXP_WIDTH = 5
+  val FP16_SIG_WIDTH = 11
 
   val FUNCT_CONFIG  = 0.U(7.W)
   val FUNCT_DATA    = 1.U(7.W)
@@ -122,8 +125,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   val tileMacRow = RegInit(0.U(3.W))
 
-  val tileAcc    = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.S(40.W))))
-  val tileOutReg = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
+  val tileAcc      = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.S(40.W))))
+  val tileFloatAcc = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
+  val tileOutReg   = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
 
   val storeIdx      = RegInit(0.U(11.W))
   val storeInflight = RegInit(false.B)
@@ -137,7 +141,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val validKernelSize =
     (rs1Reg === 1.U) || (rs1Reg === 3.U) || (rs1Reg === 5.U)
 
-  val validDataType = rs2Reg(1, 0) === DATA_FIXED16
+  val validDataType =
+    (rs2Reg(1, 0) === DATA_FIXED16) ||
+    (rs2Reg(1, 0) === DATA_FLOAT16)
 
   cmd.ready := false.B
 
@@ -157,6 +163,31 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.signed := true.B
   io.mem.req.bits.data := 0.U
   io.mem.req.bits.dprv := dprvReg
+
+  // Multiply two raw FP16 values and return a raw FP16 result.
+  def fp16Mul(a: UInt, b: UInt): UInt = {
+    val mul = Module(new MulRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
+
+    mul.io.a := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, a)
+    mul.io.b := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, b)
+    mul.io.roundingMode := 0.U(3.W)
+    mul.io.detectTininess := 0.U(1.W)
+
+    fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, mul.io.out)
+  }
+
+  // Add two raw FP16 values and return a raw FP16 result.
+  def fp16Add(a: UInt, b: UInt): UInt = {
+    val add = Module(new AddRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
+
+    add.io.subOp := false.B
+    add.io.a := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, a)
+    add.io.b := recFNFromFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, b)
+    add.io.roundingMode := 0.U(3.W)
+    add.io.detectTininess := 0.U(1.W)
+
+    fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, add.io.out)
+  }
 
   val tileRadius  = kernelSizeReg >> 1
   val tileBaseRow = tileBaseRowReg
@@ -208,7 +239,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   //   - four consecutive image columns fit inside the 32-wide input row,
   //   - the starting image column is a multiple of four, so the byte address is 8-byte aligned.
   //
-  // Unlike Phase 5A, this version does not require four tile columns to remain.
   // At the tail of a tile row it still performs one aligned 64-bit read but only
   // commits the useful returned halfwords to tileBuf.
   val tileLoadCanWide =
@@ -222,6 +252,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val biasTerm = Wire(SInt(40.W))
   biasTerm := Mux(biasEnableReg, biasBuf.asSInt, 0.S(40.W))
 
+  // Fixed16 row-level datapath.
   val tileTerms   = Wire(Vec(TILE_OUTPUTS, Vec(MAX_KERNEL_SIZE, SInt(40.W))))
   val tileRowSum  = Wire(Vec(TILE_OUTPUTS, SInt(40.W)))
   val tileNextAcc = Wire(Vec(TILE_OUTPUTS, SInt(40.W)))
@@ -248,6 +279,43 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     tileNextAcc(o) := (tileAcc(o) + tileRowSum(o)).asUInt(39, 0).asSInt
   }
 
+  // Float16 row-level datapath.
+  // This preserves the Phase 5B tile traversal but uses HardFloat for MAC.
+  // The add chain is left-folded to make rounding behavior closer to sequential MAC.
+  val tileFloatTerms    = Wire(Vec(TILE_OUTPUTS, Vec(MAX_KERNEL_SIZE, UInt(16.W))))
+  val tileFloatNextAcc  = Wire(Vec(TILE_OUTPUTS, UInt(16.W)))
+  val tileFloatFinalOut = Wire(Vec(TILE_OUTPUTS, UInt(16.W)))
+
+  for (o <- 0 until TILE_OUTPUTS) {
+    for (kc <- 0 until MAX_KERNEL_SIZE) {
+      val validKc = kc.U < kernelSizeReg
+      val tileCol = (kc + o).U(4.W)
+      val kernelElem = ((tileMacRow * kernelSizeReg) +& kc.U(3.W))(4, 0)
+
+      val inVal  = tileBuf(tileMacRow)(tileCol(2, 0))
+      val kerVal = kernelBuf(kernelElem)
+      val prod   = fp16Mul(inVal, kerVal)
+
+      // Invalid kernel columns contribute +0.0 half.
+      tileFloatTerms(o)(kc) := Mux(validKc, prod, 0.U(16.W))
+    }
+
+    val acc1 = fp16Add(tileFloatAcc(o), tileFloatTerms(o)(0))
+    val acc2 = fp16Add(acc1, tileFloatTerms(o)(1))
+    val acc3 = fp16Add(acc2, tileFloatTerms(o)(2))
+    val acc4 = fp16Add(acc3, tileFloatTerms(o)(3))
+    val acc5 = fp16Add(acc4, tileFloatTerms(o)(4))
+
+    tileFloatNextAcc(o) := Mux(
+      kernelSizeReg === 1.U,
+      acc1,
+      Mux(kernelSizeReg === 3.U, acc3, acc5)
+    )
+
+    val withBias = fp16Add(tileFloatNextAcc(o), biasBuf)
+    tileFloatFinalOut(o) := Mux(biasEnableReg, withBias, tileFloatNextAcc(o))
+  }
+
   val tileStoreData = Cat(tileOutReg(3), tileOutReg(2), tileOutReg(1), tileOutReg(0))
 
   def resetTileLoadCursors(startRow: UInt): Unit = {
@@ -263,6 +331,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   def resetTileAccumulators(): Unit = {
     for (i <- 0 until TILE_OUTPUTS) {
       tileAcc(i) := 0.S
+      tileFloatAcc(i) := 0.U
       tileOutReg(i) := 0.U
     }
   }
@@ -339,7 +408,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         }
 
       }.elsewhen(doCompute) {
-        when(configuredReg && kernelConfiguredReg && loadedReg && dataTypeReg === DATA_FIXED16) {
+        when(configuredReg && kernelConfiguredReg && loadedReg) {
           tileBaseRowReg := 0.U
           tileBaseColReg := 0.U
           tileReuseActiveReg := false.B
@@ -573,28 +642,55 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         }
 
         is(ftCompute) {
-          when(tileMacRow === (kernelSizeReg - 1.U)) {
-            for (i <- 0 until TILE_OUTPUTS) {
-              val finalOut = (tileNextAcc(i) + biasTerm).asUInt(15, 0)
-              tileOutReg(i) := finalOut
-              outputBuf((tileOutBaseIdx + i.U)(9, 0)) := finalOut
-            }
+          when(dataTypeReg === DATA_FLOAT16) {
+            when(tileMacRow === (kernelSizeReg - 1.U)) {
+              for (i <- 0 until TILE_OUTPUTS) {
+                val finalOut = tileFloatFinalOut(i)
+                tileOutReg(i) := finalOut
+                outputBuf((tileOutBaseIdx + i.U)(9, 0)) := finalOut
+              }
 
-            when(tileBaseRowReg === (INPUT_SIZE - 1).U) {
-              tileBaseRowReg := 0.U
-              tileBaseColReg := tileBaseColReg + TILE_OUTPUTS.U
+              when(tileBaseRowReg === (INPUT_SIZE - 1).U) {
+                tileBaseRowReg := 0.U
+                tileBaseColReg := tileBaseColReg + TILE_OUTPUTS.U
+              }.otherwise {
+                tileBaseRowReg := tileBaseRowReg + 1.U
+              }
+
+              fixedTileState := ftIdle
+
             }.otherwise {
-              tileBaseRowReg := tileBaseRowReg + 1.U
-            }
+              for (i <- 0 until TILE_OUTPUTS) {
+                tileFloatAcc(i) := tileFloatNextAcc(i)
+              }
 
-            fixedTileState := ftIdle
+              tileMacRow := tileMacRow + 1.U
+            }
 
           }.otherwise {
-            for (i <- 0 until TILE_OUTPUTS) {
-              tileAcc(i) := tileNextAcc(i)
-            }
+            when(tileMacRow === (kernelSizeReg - 1.U)) {
+              for (i <- 0 until TILE_OUTPUTS) {
+                val finalOut = (tileNextAcc(i) + biasTerm).asUInt(15, 0)
+                tileOutReg(i) := finalOut
+                outputBuf((tileOutBaseIdx + i.U)(9, 0)) := finalOut
+              }
 
-            tileMacRow := tileMacRow + 1.U
+              when(tileBaseRowReg === (INPUT_SIZE - 1).U) {
+                tileBaseRowReg := 0.U
+                tileBaseColReg := tileBaseColReg + TILE_OUTPUTS.U
+              }.otherwise {
+                tileBaseRowReg := tileBaseRowReg + 1.U
+              }
+
+              fixedTileState := ftIdle
+
+            }.otherwise {
+              for (i <- 0 until TILE_OUTPUTS) {
+                tileAcc(i) := tileNextAcc(i)
+              }
+
+              tileMacRow := tileMacRow + 1.U
+            }
           }
         }
 
