@@ -10,23 +10,24 @@ import freechips.rocketchip.rocket._
 import hardfloat._
 
 // =============================================================================
-// Phase 6B accelerator.
-// Fixed16 path:
-//   - Keeps the Phase 5B optimized tile path.
-//   - 2D shared tileBuf.
-//   - Vertical sliding reuse.
-//   - Safe partial-tail 64-bit input loads.
-//   - 4-output packed store.
+// Phase 6C conservative pipelined accelerator.
 //
-// Float16 path:
-//   - Uses the same Phase 5B tile traversal, tileBuf loading, reuse, and store.
-//   - Adds a 4-output row-MAC datapath using HardFloat.
-//   - Uses raw FP16 -> recFN -> HardFloat op -> raw FP16 conversion.
-//   - Accumulates each kernel row with a left-fold fp16 add chain.
+// External RoCC command FSM is intentionally kept compatible with Phase 6B:
+//   sIdle -> sDecode -> sConfig/sKernel/sLoad/sCompute/sStore/sRespond
+//
+// Internal tile execution is changed from one sequential fixedTileState FSM into
+// three independent engines inside sCompute:
+//   1. Load engine    : loads the next tile into a free ping-pong tile buffer
+//   2. Compute engine : computes a ready tile from another tile buffer
+//   3. Store engine   : stores packed 4-output results from outputQ
+//
+// This version does not implement cross-buffer vertical row reuse yet. That is
+// intentional: the first pipeline version should prove correct buffer ownership,
+// queueing, and load/compute/store overlap before adding reuse metadata.
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 6B tile HardFloat row-MAC version")
+  println("DEBUG: Elaborating MyConvAccel Phase 6C conservative pipelined version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -44,7 +45,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
   val TILE_OUTPUTS     = 4
   val MAX_TILE_WIDTH   = MAX_KERNEL_SIZE + TILE_OUTPUTS - 1
-  val MAX_TILE_ELEMS   = MAX_KERNEL_SIZE * MAX_TILE_WIDTH
+  val TOTAL_TILES      = INPUT_ELEMS / TILE_OUTPUTS
 
   val RET_ERROR   = 0.U(xLen.W)
   val RET_SUCCESS = 1.U(xLen.W)
@@ -64,11 +65,34 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val PRELOAD_KERNEL = 0.U(1.W)
   val PRELOAD_BIAS   = 1.U(1.W)
 
+  // The external command FSM is kept unchanged for software compatibility.
   val sIdle :: sDecode :: sConfig :: sKernel :: sLoad :: sCompute :: sStore :: sRespond :: Nil = Enum(8)
   val state = RegInit(sIdle)
 
-  val ftIdle :: ftReuseRows :: ftLoadTile :: ftLoadWait :: ftCompute :: ftStore :: ftStoreWait :: ftDone :: Nil = Enum(8)
-  val fixedTileState = RegInit(ftIdle)
+  // Internal pipelined engines used only inside sCompute.
+  val loadIdle :: loadRun :: loadEnq :: Nil = Enum(3)
+  val loadState = RegInit(loadIdle)
+
+  val computeIdle :: computeRun :: Nil = Enum(2)
+  val computeState = RegInit(computeIdle)
+
+  val bufFree :: bufLoading :: bufReady :: bufComputing :: Nil = Enum(4)
+
+  val memNone :: memLoadTile :: memStoreOut :: Nil = Enum(3)
+
+  class TileDesc extends Bundle {
+    val row   = UInt(6.W)
+    val col   = UInt(6.W)
+    val bufId = UInt(1.W)
+  }
+
+  class StoreDesc(val coreXLen: Int) extends Bundle {
+    val addr = UInt(coreXLen.W)
+    val data = UInt(64.W)
+  }
+
+  val loadToComputeQ = Module(new Queue(new TileDesc, 4))
+  val outputQ        = Module(new Queue(new StoreDesc(xLen), 8))
 
   val functReg = RegInit(0.U(7.W))
   val rs1Reg   = RegInit(0.U(xLen.W))
@@ -94,43 +118,56 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val resultReg = RegInit(RET_ERROR)
 
   val kernelBuf = Reg(Vec(MAX_KERNEL_ELEMS, UInt(16.W)))
-  val outputBuf = Reg(Vec(INPUT_ELEMS, UInt(16.W)))
   val biasBuf   = RegInit(0.U(16.W))
 
-  val tileBuf = Reg(Vec(MAX_KERNEL_SIZE, Vec(MAX_TILE_WIDTH, UInt(16.W))))
+  // Two tile buffers allow loading tile N+1 while computing tile N.
+  val tileBuf = Reg(Vec(2, Vec(MAX_KERNEL_SIZE, Vec(MAX_TILE_WIDTH, UInt(16.W)))))
+  val tileBufState = RegInit(VecInit(Seq.fill(2)(bufFree)))
 
   val preloadIdx      = RegInit(0.U(6.W))
   val preloadInflight = RegInit(false.B)
   val preloadType     = RegInit(PRELOAD_KERNEL)
   val biasLoadedReg   = RegInit(true.B)
 
-  // Tile traversal is column-block-major for vertical reuse:
-  //   col block 0: rows 0..31, then col block 4: rows 0..31, etc.
-  val tileBaseRowReg = RegInit(0.U(6.W))
-  val tileBaseColReg = RegInit(0.U(6.W))
+  // Tile generator. Traversal remains column-block-major: col 0 rows 0..31,
+  // then col 4 rows 0..31, etc.
+  val tileGenRowReg = RegInit(0.U(6.W))
+  val tileGenColReg = RegInit(0.U(6.W))
 
-  val tileLoadRow = RegInit(0.U(3.W))
-  val tileLoadCol = RegInit(0.U(4.W))
-  val tileLoadCnt = RegInit(0.U(6.W))
+  val tilesIssuedCnt  = RegInit(0.U(9.W))
+  val tilesLoadedCnt  = RegInit(0.U(9.W))
+  val tilesComputedCnt = RegInit(0.U(9.W))
+  val tilesStoredCnt  = RegInit(0.U(9.W))
 
-  val tileReuseActiveReg = RegInit(false.B)
+  // Load engine registers.
+  val loadBaseRowReg = RegInit(0.U(6.W))
+  val loadBaseColReg = RegInit(0.U(6.W))
+  val loadBufIdReg   = RegInit(0.U(1.W))
+  val tileLoadRow    = RegInit(0.U(3.W))
+  val tileLoadCol    = RegInit(0.U(4.W))
+  val tileLoadCnt    = RegInit(0.U(6.W))
 
-  // Tracks whether the outstanding input tile load was a 64-bit load.
-  // Scalar loads write one tileBuf element; wide loads write up to four adjacent elements.
-  val tileLoadWideReg = RegInit(false.B)
+  // Metadata for the single outstanding tile load request.
+  val memInflight = RegInit(false.B)
+  val memKindReg  = RegInit(memNone)
+  val memLoadBufIdReg = RegInit(0.U(1.W))
+  val memLoadRowReg   = RegInit(0.U(3.W))
+  val memLoadColReg   = RegInit(0.U(4.W))
+  val memLoadWideReg  = RegInit(false.B)
+  val memLoadWideCountReg = RegInit(0.U(3.W))
 
-  // Number of useful halfwords returned by the outstanding wide load.
-  // This can be less than four for tail columns at the end of a tile row.
-  val tileLoadWideCountReg = RegInit(0.U(3.W))
+  // Round-robin hint for the single RoCC memory request port.
+  val memPreferStore = RegInit(false.B)
 
-  val tileMacRow = RegInit(0.U(3.W))
+  // Compute engine registers.
+  val computeBaseRowReg = RegInit(0.U(6.W))
+  val computeBaseColReg = RegInit(0.U(6.W))
+  val computeBufIdReg   = RegInit(0.U(1.W))
+  val computeMacRow     = RegInit(0.U(3.W))
 
   val tileAcc      = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.S(40.W))))
   val tileFloatAcc = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
   val tileOutReg   = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
-
-  val storeIdx      = RegInit(0.U(11.W))
-  val storeInflight = RegInit(false.B)
 
   val doConfig  = functReg === FUNCT_CONFIG
   val doData    = functReg === FUNCT_DATA
@@ -164,6 +201,14 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   io.mem.req.bits.data := 0.U
   io.mem.req.bits.dprv := dprvReg
 
+  loadToComputeQ.io.enq.valid := false.B
+  loadToComputeQ.io.enq.bits := 0.U.asTypeOf(new TileDesc)
+  loadToComputeQ.io.deq.ready := false.B
+
+  outputQ.io.enq.valid := false.B
+  outputQ.io.enq.bits := 0.U.asTypeOf(new StoreDesc(xLen))
+  outputQ.io.deq.ready := false.B
+
   // Multiply two raw FP16 values and return a raw FP16 result.
   def fp16Mul(a: UInt, b: UInt): UInt = {
     val mul = Module(new MulRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH))
@@ -189,81 +234,52 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     fNFromRecFN(FP16_EXP_WIDTH, FP16_SIG_WIDTH, add.io.out)
   }
 
-  val tileRadius  = kernelSizeReg >> 1
-  val tileBaseRow = tileBaseRowReg
-  val tileBaseCol = tileBaseColReg
+  val tileRadius = kernelSizeReg >> 1
+  val tileWidth  = kernelSizeReg +& (TILE_OUTPUTS - 1).U(3.W)
+  val tileElems  = (kernelSizeReg * tileWidth)(5, 0)
+  val tileLoadDone = tileLoadCnt >= tileElems
 
-  val tileOutBaseIdx = (tileBaseRowReg << 5) + tileBaseColReg
-
-  val tileWidth = kernelSizeReg +& (TILE_OUTPUTS - 1).U(3.W)
-  val tileElems = (kernelSizeReg * tileWidth)(5, 0)
-
-  val tileReuseStartRow = Wire(UInt(3.W))
-  tileReuseStartRow := kernelSizeReg - 1.U
-
-  val tileLoadStartRow = Mux(tileReuseActiveReg, tileReuseStartRow, 0.U(3.W))
-
-  val tileLoadDone = Mux(
-    tileReuseActiveReg,
-    tileLoadRow >= kernelSizeReg,
-    tileLoadCnt >= tileElems
-  )
-
-  val tileCanReuseVert = tileBaseRowReg =/= 0.U
-
-  val tileLoadInRowS =
-    tileBaseRow.zext + tileLoadRow.zext - tileRadius.zext
-
-  val tileLoadInColS =
-    tileBaseCol.zext + tileLoadCol.zext - tileRadius.zext
+  val loadInRowS = loadBaseRowReg.zext + tileLoadRow.zext - tileRadius.zext
+  val loadInColS = loadBaseColReg.zext + tileLoadCol.zext - tileRadius.zext
 
   val tileLoadInputValid =
-    tileLoadInRowS >= 0.S && tileLoadInRowS < INPUT_SIZE.S &&
-    tileLoadInColS >= 0.S && tileLoadInColS < INPUT_SIZE.S
+    loadInRowS >= 0.S && loadInRowS < INPUT_SIZE.S &&
+    loadInColS >= 0.S && loadInColS < INPUT_SIZE.S
 
-  val tileLoadMemIndex = (tileLoadInRowS.asUInt << 5) + tileLoadInColS.asUInt
+  val tileLoadMemIndex = (loadInRowS.asUInt << 5) + loadInColS.asUInt
   val tileLoadMemAddr  = inputAddrReg + (tileLoadMemIndex << 1)
 
-  // Number of runtime tile columns remaining in the current tile row.
   val tileLoadColsRemaining = tileWidth - tileLoadCol
-
   val tileLoadWideCount = Mux(
     tileLoadColsRemaining >= 4.U,
     4.U(3.W),
     tileLoadColsRemaining(2, 0)
   )
 
-  // Safe wide-load condition:
-  //   - current element is valid,
-  //   - at least one tile column remains,
-  //   - four consecutive image columns fit inside the 32-wide input row,
-  //   - the starting image column is a multiple of four, so the byte address is 8-byte aligned.
-  //
-  // At the tail of a tile row it still performs one aligned 64-bit read but only
-  // commits the useful returned halfwords to tileBuf.
   val tileLoadCanWide =
     tileLoadInputValid &&
     (tileLoadCol < tileWidth) &&
     (tileLoadWideCount =/= 0.U) &&
-    (tileLoadInColS >= 0.S) &&
-    (tileLoadInColS <= (INPUT_SIZE - 4).S) &&
-    (tileLoadInColS.asUInt(1, 0) === 0.U)
+    (loadInColS >= 0.S) &&
+    (loadInColS <= (INPUT_SIZE - 4).S) &&
+    (loadInColS.asUInt(1, 0) === 0.U)
 
   val biasTerm = Wire(SInt(40.W))
   biasTerm := Mux(biasEnableReg, biasBuf.asSInt, 0.S(40.W))
 
   // Fixed16 row-level datapath.
-  val tileTerms   = Wire(Vec(TILE_OUTPUTS, Vec(MAX_KERNEL_SIZE, SInt(40.W))))
-  val tileRowSum  = Wire(Vec(TILE_OUTPUTS, SInt(40.W)))
-  val tileNextAcc = Wire(Vec(TILE_OUTPUTS, SInt(40.W)))
+  val tileTerms    = Wire(Vec(TILE_OUTPUTS, Vec(MAX_KERNEL_SIZE, SInt(40.W))))
+  val tileRowSum   = Wire(Vec(TILE_OUTPUTS, SInt(40.W)))
+  val tileNextAcc  = Wire(Vec(TILE_OUTPUTS, SInt(40.W)))
+  val fixedFinalOut = Wire(Vec(TILE_OUTPUTS, UInt(16.W)))
 
   for (o <- 0 until TILE_OUTPUTS) {
     for (kc <- 0 until MAX_KERNEL_SIZE) {
       val validKc = kc.U < kernelSizeReg
       val tileCol = (kc + o).U(4.W)
-      val kernelElem = ((tileMacRow * kernelSizeReg) +& kc.U(3.W))(4, 0)
+      val kernelElem = ((computeMacRow * kernelSizeReg) +& kc.U(3.W))(4, 0)
 
-      val inVal  = tileBuf(tileMacRow)(tileCol(2, 0)).asSInt
+      val inVal  = tileBuf(computeBufIdReg)(computeMacRow)(tileCol(2, 0)).asSInt
       val kerVal = kernelBuf(kernelElem).asSInt
 
       val rawProduct = inVal * kerVal
@@ -275,13 +291,12 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     val sum01 = (tileTerms(o)(0) + tileTerms(o)(1)).asUInt(39, 0).asSInt
     val sum23 = (tileTerms(o)(2) + tileTerms(o)(3)).asUInt(39, 0).asSInt
 
-    tileRowSum(o)  := (sum01 + sum23 + tileTerms(o)(4)).asUInt(39, 0).asSInt
-    tileNextAcc(o) := (tileAcc(o) + tileRowSum(o)).asUInt(39, 0).asSInt
+    tileRowSum(o)   := (sum01 + sum23 + tileTerms(o)(4)).asUInt(39, 0).asSInt
+    tileNextAcc(o)  := (tileAcc(o) + tileRowSum(o)).asUInt(39, 0).asSInt
+    fixedFinalOut(o) := (tileNextAcc(o) + biasTerm).asUInt(15, 0)
   }
 
   // Float16 row-level datapath.
-  // This preserves the Phase 5B tile traversal but uses HardFloat for MAC.
-  // The add chain is left-folded to make rounding behavior closer to sequential MAC.
   val tileFloatTerms    = Wire(Vec(TILE_OUTPUTS, Vec(MAX_KERNEL_SIZE, UInt(16.W))))
   val tileFloatNextAcc  = Wire(Vec(TILE_OUTPUTS, UInt(16.W)))
   val tileFloatFinalOut = Wire(Vec(TILE_OUTPUTS, UInt(16.W)))
@@ -290,9 +305,9 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     for (kc <- 0 until MAX_KERNEL_SIZE) {
       val validKc = kc.U < kernelSizeReg
       val tileCol = (kc + o).U(4.W)
-      val kernelElem = ((tileMacRow * kernelSizeReg) +& kc.U(3.W))(4, 0)
+      val kernelElem = ((computeMacRow * kernelSizeReg) +& kc.U(3.W))(4, 0)
 
-      val inVal  = tileBuf(tileMacRow)(tileCol(2, 0))
+      val inVal  = tileBuf(computeBufIdReg)(computeMacRow)(tileCol(2, 0))
       val kerVal = kernelBuf(kernelElem)
       val prod   = fp16Mul(inVal, kerVal)
 
@@ -316,16 +331,23 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     tileFloatFinalOut(o) := Mux(biasEnableReg, withBias, tileFloatNextAcc(o))
   }
 
-  val tileStoreData = Cat(tileOutReg(3), tileOutReg(2), tileOutReg(1), tileOutReg(0))
+  val selectedFinalOut = Wire(Vec(TILE_OUTPUTS, UInt(16.W)))
+  for (i <- 0 until TILE_OUTPUTS) {
+    selectedFinalOut(i) := Mux(dataTypeReg === DATA_FLOAT16, tileFloatFinalOut(i), fixedFinalOut(i))
+  }
 
-  def resetTileLoadCursors(startRow: UInt): Unit = {
-    tileLoadRow := startRow
+  val computeOutBaseIdx = (computeBaseRowReg << 5) + computeBaseColReg
+  val computeStoreAddr  = outputAddrReg + (computeOutBaseIdx << 1)
+  val computeStoreData  = Cat(selectedFinalOut(3), selectedFinalOut(2), selectedFinalOut(1), selectedFinalOut(0))
+
+  def resetTileLoadCursors(): Unit = {
+    tileLoadRow := 0.U
     tileLoadCol := 0.U
     tileLoadCnt := 0.U
   }
 
   def resetTileComputeCursors(): Unit = {
-    tileMacRow := 0.U
+    computeMacRow := 0.U
   }
 
   def resetTileAccumulators(): Unit = {
@@ -333,6 +355,15 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       tileAcc(i) := 0.S
       tileFloatAcc(i) := 0.U
       tileOutReg(i) := 0.U
+    }
+  }
+
+  def advanceTileGenerator(): Unit = {
+    when(tileGenRowReg === (INPUT_SIZE - 1).U) {
+      tileGenRowReg := 0.U
+      tileGenColReg := tileGenColReg + TILE_OUTPUTS.U
+    }.otherwise {
+      tileGenRowReg := tileGenRowReg + 1.U
     }
   }
 
@@ -358,6 +389,31 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }.otherwise {
       tileLoadCol := nextCol(3, 0)
     }
+  }
+
+  def clearPipelineState(): Unit = {
+    loadState := loadIdle
+    computeState := computeIdle
+
+    tileGenRowReg := 0.U
+    tileGenColReg := 0.U
+
+    tilesIssuedCnt := 0.U
+    tilesLoadedCnt := 0.U
+    tilesComputedCnt := 0.U
+    tilesStoredCnt := 0.U
+
+    for (b <- 0 until 2) {
+      tileBufState(b) := bufFree
+    }
+
+    resetTileLoadCursors()
+    resetTileComputeCursors()
+    resetTileAccumulators()
+
+    memInflight := false.B
+    memKindReg := memNone
+    memPreferStore := false.B
   }
 
   switch(state) {
@@ -409,16 +465,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
       }.elsewhen(doCompute) {
         when(configuredReg && kernelConfiguredReg && loadedReg) {
-          tileBaseRowReg := 0.U
-          tileBaseColReg := 0.U
-          tileReuseActiveReg := false.B
-          tileLoadWideReg := false.B
-          tileLoadWideCountReg := 0.U(3.W)
-          resetTileLoadCursors(0.U)
-          resetTileComputeCursors()
-          resetTileAccumulators()
-
-          fixedTileState := ftIdle
+          clearPipelineState()
           computedReg := false.B
           state := sCompute
         }.otherwise {
@@ -428,8 +475,6 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
       }.elsewhen(doStore) {
         when(computedReg) {
-          storeIdx := 0.U
-          storeInflight := false.B
           state := sStore
         }.otherwise {
           resultReg := RET_ERROR
@@ -542,205 +587,195 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sCompute) {
-      switch(fixedTileState) {
+      val totalTiles = TOTAL_TILES.U(9.W)
+      val allTileLoadsStarted = tilesIssuedCnt === totalTiles
+      val hasFreeBuf = (tileBufState(0) === bufFree) || (tileBufState(1) === bufFree)
+      val freeBufId = Mux(tileBufState(0) === bufFree, 0.U(1.W), 1.U(1.W))
 
-        is(ftIdle) {
-          when(tileBaseColReg >= INPUT_SIZE.U) {
-            computedReg := true.B
-            resultReg := RET_SUCCESS
-            fixedTileState := ftDone
-            state := sRespond
-          }.otherwise {
-            resetTileComputeCursors()
-            resetTileAccumulators()
-
-            when(tileCanReuseVert) {
-              tileReuseActiveReg := true.B
-              tileLoadWideReg := false.B
-              tileLoadWideCountReg := 0.U(3.W)
-              fixedTileState := ftReuseRows
-            }.otherwise {
-              tileReuseActiveReg := false.B
-              tileLoadWideReg := false.B
-              tileLoadWideCountReg := 0.U(3.W)
-              resetTileLoadCursors(0.U)
-              fixedTileState := ftLoadTile
-            }
+      // -----------------------------
+      // Load engine.
+      // -----------------------------
+      switch(loadState) {
+        is(loadIdle) {
+          when(!allTileLoadsStarted && hasFreeBuf) {
+            loadBaseRowReg := tileGenRowReg
+            loadBaseColReg := tileGenColReg
+            loadBufIdReg := freeBufId
+            tileBufState(freeBufId) := bufLoading
+            resetTileLoadCursors()
+            tilesIssuedCnt := tilesIssuedCnt + 1.U
+            advanceTileGenerator()
+            loadState := loadRun
           }
         }
 
-        is(ftReuseRows) {
-          // Reuse the overlapping rows from the previous output row in the
-          // same 4-column block: new row 0 gets old row 1, etc.
-          for (r <- 0 until (MAX_KERNEL_SIZE - 1)) {
-            for (c <- 0 until MAX_TILE_WIDTH) {
-              when(r.U < (kernelSizeReg - 1.U) && c.U < tileWidth) {
-                tileBuf(r)(c) := tileBuf(r + 1)(c)
-              }
-            }
-          }
-
-          tileLoadWideReg := false.B
-          tileLoadWideCountReg := 0.U(3.W)
-          resetTileLoadCursors(tileReuseStartRow)
-          fixedTileState := ftLoadTile
-        }
-
-        is(ftLoadTile) {
+        is(loadRun) {
           when(tileLoadDone) {
-            resetTileComputeCursors()
-            fixedTileState := ftCompute
-
+            loadState := loadEnq
           }.elsewhen(!tileLoadInputValid) {
-            tileBuf(tileLoadRow)(tileLoadCol(2, 0)) := 0.U
+            tileBuf(loadBufIdReg)(tileLoadRow)(tileLoadCol(2, 0)) := 0.U
             advanceTileLoadCursor()
-
-          }.otherwise {
-            io.mem.req.valid := true.B
-            io.mem.req.bits.addr := tileLoadMemAddr
-            io.mem.req.bits.tag := 0.U
-            io.mem.req.bits.cmd := M_XRD
-            io.mem.req.bits.size := Mux(tileLoadCanWide, 3.U, 1.U)
-            io.mem.req.bits.signed := true.B
-            io.mem.req.bits.dprv := dprvReg
-
-            when(io.mem.req.fire) {
-              tileLoadWideReg := tileLoadCanWide
-              tileLoadWideCountReg := Mux(tileLoadCanWide, tileLoadWideCount, 0.U(3.W))
-              fixedTileState := ftLoadWait
-            }
           }
         }
 
-        is(ftLoadWait) {
-          when(io.mem.resp.valid) {
-            when(tileLoadWideReg) {
-              tileBuf(tileLoadRow)(tileLoadCol(2, 0)) := io.mem.resp.bits.data(15, 0)
+        is(loadEnq) {
+          loadToComputeQ.io.enq.valid := true.B
+          loadToComputeQ.io.enq.bits.row := loadBaseRowReg
+          loadToComputeQ.io.enq.bits.col := loadBaseColReg
+          loadToComputeQ.io.enq.bits.bufId := loadBufIdReg
 
-              when(tileLoadWideCountReg >= 2.U) {
-                tileBuf(tileLoadRow)((tileLoadCol + 1.U)(2, 0)) := io.mem.resp.bits.data(31, 16)
-              }
-
-              when(tileLoadWideCountReg >= 3.U) {
-                tileBuf(tileLoadRow)((tileLoadCol + 2.U)(2, 0)) := io.mem.resp.bits.data(47, 32)
-              }
-
-              when(tileLoadWideCountReg >= 4.U) {
-                tileBuf(tileLoadRow)((tileLoadCol + 3.U)(2, 0)) := io.mem.resp.bits.data(63, 48)
-              }
-
-              advanceTileLoadCursorByN(tileLoadWideCountReg)
-            }.otherwise {
-              tileBuf(tileLoadRow)(tileLoadCol(2, 0)) := io.mem.resp.bits.data(15, 0)
-              advanceTileLoadCursor()
-            }
-
-            tileLoadWideReg := false.B
-            tileLoadWideCountReg := 0.U(3.W)
-            fixedTileState := ftLoadTile
+          when(loadToComputeQ.io.enq.fire) {
+            tileBufState(loadBufIdReg) := bufReady
+            tilesLoadedCnt := tilesLoadedCnt + 1.U
+            loadState := loadIdle
           }
-        }
-
-        is(ftCompute) {
-          when(dataTypeReg === DATA_FLOAT16) {
-            when(tileMacRow === (kernelSizeReg - 1.U)) {
-              for (i <- 0 until TILE_OUTPUTS) {
-                val finalOut = tileFloatFinalOut(i)
-                tileOutReg(i) := finalOut
-                outputBuf((tileOutBaseIdx + i.U)(9, 0)) := finalOut
-              }
-
-              when(tileBaseRowReg === (INPUT_SIZE - 1).U) {
-                tileBaseRowReg := 0.U
-                tileBaseColReg := tileBaseColReg + TILE_OUTPUTS.U
-              }.otherwise {
-                tileBaseRowReg := tileBaseRowReg + 1.U
-              }
-
-              fixedTileState := ftIdle
-
-            }.otherwise {
-              for (i <- 0 until TILE_OUTPUTS) {
-                tileFloatAcc(i) := tileFloatNextAcc(i)
-              }
-
-              tileMacRow := tileMacRow + 1.U
-            }
-
-          }.otherwise {
-            when(tileMacRow === (kernelSizeReg - 1.U)) {
-              for (i <- 0 until TILE_OUTPUTS) {
-                val finalOut = (tileNextAcc(i) + biasTerm).asUInt(15, 0)
-                tileOutReg(i) := finalOut
-                outputBuf((tileOutBaseIdx + i.U)(9, 0)) := finalOut
-              }
-
-              when(tileBaseRowReg === (INPUT_SIZE - 1).U) {
-                tileBaseRowReg := 0.U
-                tileBaseColReg := tileBaseColReg + TILE_OUTPUTS.U
-              }.otherwise {
-                tileBaseRowReg := tileBaseRowReg + 1.U
-              }
-
-              fixedTileState := ftIdle
-
-            }.otherwise {
-              for (i <- 0 until TILE_OUTPUTS) {
-                tileAcc(i) := tileNextAcc(i)
-              }
-
-              tileMacRow := tileMacRow + 1.U
-            }
-          }
-        }
-
-        is(ftStore) {
-          fixedTileState := ftIdle
-        }
-
-        is(ftStoreWait) {
-          fixedTileState := ftIdle
-        }
-
-        is(ftDone) {
-          computedReg := true.B
-          resultReg := RET_SUCCESS
-          state := sRespond
         }
       }
-    }
 
-    is(sStore) {
-      when(storeIdx < INPUT_ELEMS.U) {
-        when(!storeInflight) {
-          io.mem.req.valid := true.B
-          io.mem.req.bits.addr := outputAddrReg + (storeIdx << 1)
-          io.mem.req.bits.tag := 2.U
-          io.mem.req.bits.cmd := M_XWR
-          io.mem.req.bits.size := 3.U
-          io.mem.req.bits.signed := false.B
-          io.mem.req.bits.data := Cat(
-            outputBuf((storeIdx + 3.U)(9, 0)),
-            outputBuf((storeIdx + 2.U)(9, 0)),
-            outputBuf((storeIdx + 1.U)(9, 0)),
-            outputBuf(storeIdx(9, 0))
-          )
-          io.mem.req.bits.dprv := dprvReg
+      // -----------------------------
+      // Compute engine.
+      // -----------------------------
+      when(computeState === computeIdle) {
+        loadToComputeQ.io.deq.ready := true.B
 
-          when(io.mem.req.fire) {
-            storeInflight := true.B
-          }
+        when(loadToComputeQ.io.deq.fire) {
+          computeBaseRowReg := loadToComputeQ.io.deq.bits.row
+          computeBaseColReg := loadToComputeQ.io.deq.bits.col
+          computeBufIdReg := loadToComputeQ.io.deq.bits.bufId
+          tileBufState(loadToComputeQ.io.deq.bits.bufId) := bufComputing
+          resetTileComputeCursors()
+          resetTileAccumulators()
+          computeState := computeRun
         }
-
-        when(storeInflight && io.mem.resp.valid) {
-          storeInflight := false.B
-          storeIdx := storeIdx + TILE_OUTPUTS.U
-        }
-
       }.otherwise {
+        val isFinalMacRow = computeMacRow === (kernelSizeReg - 1.U)
+
+        when(isFinalMacRow) {
+          outputQ.io.enq.valid := true.B
+          outputQ.io.enq.bits.addr := computeStoreAddr
+          outputQ.io.enq.bits.data := computeStoreData
+
+          when(outputQ.io.enq.fire) {
+            for (i <- 0 until TILE_OUTPUTS) {
+              tileOutReg(i) := selectedFinalOut(i)
+            }
+
+            tileBufState(computeBufIdReg) := bufFree
+            tilesComputedCnt := tilesComputedCnt + 1.U
+            computeState := computeIdle
+          }
+        }.otherwise {
+          when(dataTypeReg === DATA_FLOAT16) {
+            for (i <- 0 until TILE_OUTPUTS) {
+              tileFloatAcc(i) := tileFloatNextAcc(i)
+            }
+          }.otherwise {
+            for (i <- 0 until TILE_OUTPUTS) {
+              tileAcc(i) := tileNextAcc(i)
+            }
+          }
+
+          computeMacRow := computeMacRow + 1.U
+        }
+      }
+
+      // -----------------------------
+      // Store engine and memory scheduler.
+      // Only one RoCC memory request can be issued at a time here. This still
+      // allows compute to overlap with either load or store memory latency.
+      // -----------------------------
+      val computeStarving = (computeState === computeIdle) && !loadToComputeQ.io.deq.valid
+      val loadNeedsMemory =
+        (loadState === loadRun) &&
+        !tileLoadDone &&
+        tileLoadInputValid &&
+        !memInflight
+
+      val storeNeedsMemory = outputQ.io.deq.valid && !memInflight
+      val chooseLoad = loadNeedsMemory && (!storeNeedsMemory || computeStarving || !memPreferStore)
+      val chooseStore = storeNeedsMemory && !chooseLoad
+
+      when(chooseLoad) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := tileLoadMemAddr
+        io.mem.req.bits.tag := loadBufIdReg
+        io.mem.req.bits.cmd := M_XRD
+        io.mem.req.bits.size := Mux(tileLoadCanWide, 3.U, 1.U)
+        io.mem.req.bits.signed := true.B
+        io.mem.req.bits.dprv := dprvReg
+
+        when(io.mem.req.fire) {
+          memInflight := true.B
+          memKindReg := memLoadTile
+          memLoadBufIdReg := loadBufIdReg
+          memLoadRowReg := tileLoadRow
+          memLoadColReg := tileLoadCol
+          memLoadWideReg := tileLoadCanWide
+          memLoadWideCountReg := Mux(tileLoadCanWide, tileLoadWideCount, 0.U(3.W))
+          memPreferStore := true.B
+        }
+      }.elsewhen(chooseStore) {
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := outputQ.io.deq.bits.addr
+        io.mem.req.bits.tag := 2.U
+        io.mem.req.bits.cmd := M_XWR
+        io.mem.req.bits.size := 3.U
+        io.mem.req.bits.signed := false.B
+        io.mem.req.bits.data := outputQ.io.deq.bits.data
+        io.mem.req.bits.dprv := dprvReg
+
+        outputQ.io.deq.ready := io.mem.req.ready
+
+        when(io.mem.req.fire) {
+          memInflight := true.B
+          memKindReg := memStoreOut
+          memPreferStore := false.B
+        }
+      }
+
+      // Memory response demux for the single outstanding request.
+      when(memInflight && io.mem.resp.valid) {
+        when(memKindReg === memLoadTile) {
+          when(memLoadWideReg) {
+            tileBuf(memLoadBufIdReg)(memLoadRowReg)(memLoadColReg(2, 0)) := io.mem.resp.bits.data(15, 0)
+
+            when(memLoadWideCountReg >= 2.U) {
+              tileBuf(memLoadBufIdReg)(memLoadRowReg)((memLoadColReg + 1.U)(2, 0)) := io.mem.resp.bits.data(31, 16)
+            }
+
+            when(memLoadWideCountReg >= 3.U) {
+              tileBuf(memLoadBufIdReg)(memLoadRowReg)((memLoadColReg + 2.U)(2, 0)) := io.mem.resp.bits.data(47, 32)
+            }
+
+            when(memLoadWideCountReg >= 4.U) {
+              tileBuf(memLoadBufIdReg)(memLoadRowReg)((memLoadColReg + 3.U)(2, 0)) := io.mem.resp.bits.data(63, 48)
+            }
+
+            advanceTileLoadCursorByN(memLoadWideCountReg)
+          }.otherwise {
+            tileBuf(memLoadBufIdReg)(memLoadRowReg)(memLoadColReg(2, 0)) := io.mem.resp.bits.data(15, 0)
+            advanceTileLoadCursor()
+          }
+        }.elsewhen(memKindReg === memStoreOut) {
+          tilesStoredCnt := tilesStoredCnt + 1.U
+        }
+
+        memInflight := false.B
+        memKindReg := memNone
+      }
+
+      when(tilesStoredCnt === totalTiles && !memInflight) {
+        computedReg := true.B
         resultReg := RET_SUCCESS
         state := sRespond
       }
+    }
+
+    // Store is now a compatibility state. The pipelined sCompute state has
+    // already written all output tiles to memory before it returns success.
+    is(sStore) {
+      resultReg := RET_SUCCESS
+      state := sRespond
     }
 
     is(sRespond) {
