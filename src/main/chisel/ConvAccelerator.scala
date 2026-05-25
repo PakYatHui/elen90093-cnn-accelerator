@@ -10,7 +10,7 @@ import freechips.rocketchip.rocket._
 import hardfloat._
 
 // =============================================================================
-// Phase 6C conservative pipelined accelerator.
+// Phase 7B pipelined accelerator with vertical row reuse.
 //
 // External RoCC command FSM is intentionally kept compatible with Phase 6B:
 //   sIdle -> sDecode -> sConfig/sKernel/sLoad/sCompute/sStore/sRespond
@@ -21,13 +21,15 @@ import hardfloat._
 //   2. Compute engine : computes a ready tile from another tile buffer
 //   3. Store engine   : stores packed 4-output results from outputQ
 //
-// This version does not implement cross-buffer vertical row reuse yet. That is
-// intentional: the first pipeline version should prove correct buffer ownership,
-// queueing, and load/compute/store overlap before adding reuse metadata.
+// This version restores vertical row reuse across the ping-pong tile buffers.
+// For row N in the same 4-column block, rows 1..K-1 from tile N-1 are copied
+// into rows 0..K-2 of the destination buffer, then only the newest bottom row
+// is loaded from memory. This reduces input memory traffic while keeping the
+// load/compute/store pipeline structure.
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 6C conservative pipelined version")
+  println("DEBUG: Elaborating MyConvAccel Phase 7B pipelined vertical-reuse version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -123,6 +125,15 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   // Two tile buffers allow loading tile N+1 while computing tile N.
   val tileBuf = Reg(Vec(2, Vec(MAX_KERNEL_SIZE, Vec(MAX_TILE_WIDTH, UInt(16.W)))))
   val tileBufState = RegInit(VecInit(Seq.fill(2)(bufFree)))
+
+  // Metadata for vertical row reuse between consecutive rows in the same
+  // 4-output column block. The previous tile buffer remains readable until it
+  // is selected as the destination for a later load.
+  val prevTileValidReg = RegInit(false.B)
+  val prevTileRowReg   = RegInit(0.U(6.W))
+  val prevTileColReg   = RegInit(0.U(6.W))
+  val prevTileBufIdReg = RegInit(0.U(1.W))
+  val loadReuseActiveReg = RegInit(false.B)
 
   val preloadIdx      = RegInit(0.U(6.W))
   val preloadInflight = RegInit(false.B)
@@ -237,7 +248,11 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val tileRadius = kernelSizeReg >> 1
   val tileWidth  = kernelSizeReg +& (TILE_OUTPUTS - 1).U(3.W)
   val tileElems  = (kernelSizeReg * tileWidth)(5, 0)
-  val tileLoadDone = tileLoadCnt >= tileElems
+  val tileLoadDone = Mux(
+    loadReuseActiveReg,
+    tileLoadRow >= kernelSizeReg,
+    tileLoadCnt >= tileElems
+  )
 
   val loadInRowS = loadBaseRowReg.zext + tileLoadRow.zext - tileRadius.zext
   val loadInColS = loadBaseColReg.zext + tileLoadCol.zext - tileRadius.zext
@@ -340,8 +355,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val computeStoreAddr  = outputAddrReg + (computeOutBaseIdx << 1)
   val computeStoreData  = Cat(selectedFinalOut(3), selectedFinalOut(2), selectedFinalOut(1), selectedFinalOut(0))
 
-  def resetTileLoadCursors(): Unit = {
-    tileLoadRow := 0.U
+  def resetTileLoadCursors(startRow: UInt): Unit = {
+    tileLoadRow := startRow
     tileLoadCol := 0.U
     tileLoadCnt := 0.U
   }
@@ -407,7 +422,13 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       tileBufState(b) := bufFree
     }
 
-    resetTileLoadCursors()
+    prevTileValidReg := false.B
+    prevTileRowReg := 0.U
+    prevTileColReg := 0.U
+    prevTileBufIdReg := 0.U
+    loadReuseActiveReg := false.B
+
+    resetTileLoadCursors(0.U)
     resetTileComputeCursors()
     resetTileAccumulators()
 
@@ -589,8 +610,21 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     is(sCompute) {
       val totalTiles = TOTAL_TILES.U(9.W)
       val allTileLoadsStarted = tilesIssuedCnt === totalTiles
-      val hasFreeBuf = (tileBufState(0) === bufFree) || (tileBufState(1) === bufFree)
-      val freeBufId = Mux(tileBufState(0) === bufFree, 0.U(1.W), 1.U(1.W))
+
+      val anyFreeBuf = (tileBufState(0) === bufFree) || (tileBufState(1) === bufFree)
+      val defaultFreeBufId = Mux(tileBufState(0) === bufFree, 0.U(1.W), 1.U(1.W))
+
+      val reuseCandidate =
+        prevTileValidReg &&
+        (tileGenRowReg =/= 0.U) &&
+        (tileGenColReg === prevTileColReg) &&
+        (tileGenRowReg === (prevTileRowReg + 1.U))
+
+      val reuseDestBufId = prevTileBufIdReg ^ 1.U(1.W)
+      val canReuseNow = reuseCandidate && (tileBufState(reuseDestBufId) === bufFree)
+
+      val hasFreeBuf = anyFreeBuf
+      val freeBufId = Mux(canReuseNow, reuseDestBufId, defaultFreeBufId)
 
       // -----------------------------
       // Load engine.
@@ -602,7 +636,24 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             loadBaseColReg := tileGenColReg
             loadBufIdReg := freeBufId
             tileBufState(freeBufId) := bufLoading
-            resetTileLoadCursors()
+            loadReuseActiveReg := canReuseNow
+
+            // Vertical row reuse:
+            // new row 0 gets old row 1, ..., new row K-2 gets old row K-1.
+            // Then the load engine only loads the newest bottom row K-1.
+            when(canReuseNow) {
+              for (r <- 0 until (MAX_KERNEL_SIZE - 1)) {
+                for (c <- 0 until MAX_TILE_WIDTH) {
+                  when((r.U < (kernelSizeReg - 1.U)) && (c.U < tileWidth)) {
+                    tileBuf(freeBufId)(r)(c) := tileBuf(prevTileBufIdReg)(r + 1)(c)
+                  }
+                }
+              }
+              resetTileLoadCursors(kernelSizeReg - 1.U)
+            }.otherwise {
+              resetTileLoadCursors(0.U)
+            }
+
             tilesIssuedCnt := tilesIssuedCnt + 1.U
             advanceTileGenerator()
             loadState := loadRun
@@ -626,6 +677,11 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
 
           when(loadToComputeQ.io.enq.fire) {
             tileBufState(loadBufIdReg) := bufReady
+            prevTileValidReg := true.B
+            prevTileRowReg := loadBaseRowReg
+            prevTileColReg := loadBaseColReg
+            prevTileBufIdReg := loadBufIdReg
+            loadReuseActiveReg := false.B
             tilesLoadedCnt := tilesLoadedCnt + 1.U
             loadState := loadIdle
           }
