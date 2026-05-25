@@ -10,7 +10,7 @@ import freechips.rocketchip.rocket._
 import hardfloat._
 
 // =============================================================================
-// Phase 7B pipelined accelerator with vertical row reuse.
+// Phase 7C pipelined accelerator with vertical row reuse and load-priority scheduling.
 //
 // External RoCC command FSM is intentionally kept compatible with Phase 6B:
 //   sIdle -> sDecode -> sConfig/sKernel/sLoad/sCompute/sStore/sRespond
@@ -29,7 +29,7 @@ import hardfloat._
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 7B pipelined vertical-reuse version")
+  println("DEBUG: Elaborating MyConvAccel Phase 7C load-priority pipelined vertical-reuse version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -94,7 +94,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   }
 
   val loadToComputeQ = Module(new Queue(new TileDesc, 4))
-  val outputQ        = Module(new Queue(new StoreDesc(xLen), 8))
+  val outputQ        = Module(new Queue(new StoreDesc(xLen), 16))
 
   val functReg = RegInit(0.U(7.W))
   val rs1Reg   = RegInit(0.U(xLen.W))
@@ -748,8 +748,19 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         !memInflight
 
       val storeNeedsMemory = outputQ.io.deq.valid && !memInflight
-      val chooseLoad = loadNeedsMemory && (!storeNeedsMemory || computeStarving || !memPreferStore)
-      val chooseStore = storeNeedsMemory && !chooseLoad
+
+      // Phase 7C scheduler policy:
+      //   - Prioritise input loads while the compute side is not well buffered.
+      //   - Drain stores when the output queue is close to full.
+      //   - Drain stores when there is no useful load request.
+      //
+      // This keeps the compute engine fed more aggressively than the Phase 7B
+      // round-robin policy. Stores are still protected by the larger outputQ.
+      val outputQAlmostFull = outputQ.io.count >= 12.U
+      val computeQueueLow   = loadToComputeQ.io.count <= 1.U
+      val preferLoadNow     = computeStarving || computeQueueLow || !outputQAlmostFull
+      val chooseLoad        = loadNeedsMemory && (!storeNeedsMemory || preferLoadNow)
+      val chooseStore       = storeNeedsMemory && !chooseLoad
 
       when(chooseLoad) {
         io.mem.req.valid := true.B
