@@ -10,7 +10,7 @@ import freechips.rocketchip.rocket._
 import hardfloat._
 
 // =============================================================================
-// Phase 7C pipelined accelerator with vertical row reuse and load-priority scheduling.
+// Phase 7D pipelined accelerator with vertical row reuse, load-priority scheduling, and performance counters.
 //
 // External RoCC command FSM is intentionally kept compatible with Phase 6B:
 //   sIdle -> sDecode -> sConfig/sKernel/sLoad/sCompute/sStore/sRespond
@@ -29,7 +29,7 @@ import hardfloat._
 // =============================================================================
 
 class MyConvAccel(opcodes: OpcodeSet)(implicit p: Parameters) extends LazyRoCC(opcodes) {
-  println("DEBUG: Elaborating MyConvAccel Phase 7C load-priority pipelined vertical-reuse version")
+  println("DEBUG: Elaborating MyConvAccel Phase 7D perf-counter pipelined vertical-reuse version")
   override lazy val module = new MyConvAccelModule(this)
 }
 
@@ -63,6 +63,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val FUNCT_COMPUTE = 2.U(7.W)
   val FUNCT_STORE   = 3.U(7.W)
   val FUNCT_KERNEL  = 4.U(7.W)
+  val FUNCT_DEBUG   = 5.U(7.W)
 
   val PRELOAD_KERNEL = 0.U(1.W)
   val PRELOAD_BIAS   = 1.U(1.W)
@@ -180,11 +181,41 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
   val tileFloatAcc = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
   val tileOutReg   = RegInit(VecInit(Seq.fill(TILE_OUTPUTS)(0.U(16.W))))
 
+  // Phase 7D performance counters.
+  // These counters are reset at the start of each COMPUTE command and can be
+  // read later with FUNCT_DEBUG. They are intended for benchmark/report use,
+  // not for functional correctness.
+  val perfTotalCycles          = RegInit(0.U(xLen.W))
+  val perfLoadReqs             = RegInit(0.U(xLen.W))
+  val perfStoreReqs            = RegInit(0.U(xLen.W))
+  val perfReuseTiles           = RegInit(0.U(xLen.W))
+  val perfFullLoadTiles        = RegInit(0.U(xLen.W))
+  val perfComputeWaitCycles    = RegInit(0.U(xLen.W))
+  val perfOutputQFullStallCycles = RegInit(0.U(xLen.W))
+  val perfMemBusyCycles        = RegInit(0.U(xLen.W))
+
   val doConfig  = functReg === FUNCT_CONFIG
   val doData    = functReg === FUNCT_DATA
   val doCompute = functReg === FUNCT_COMPUTE
   val doStore   = functReg === FUNCT_STORE
   val doKernel  = functReg === FUNCT_KERNEL
+  val doDebug   = functReg === FUNCT_DEBUG
+
+  val debugCounterValue = WireDefault(RET_ERROR)
+  switch(rs1Reg(3, 0)) {
+    is(0.U) { debugCounterValue := perfTotalCycles }
+    is(1.U) { debugCounterValue := perfLoadReqs }
+    is(2.U) { debugCounterValue := perfStoreReqs }
+    is(3.U) { debugCounterValue := perfReuseTiles }
+    is(4.U) { debugCounterValue := perfFullLoadTiles }
+    is(5.U) { debugCounterValue := perfComputeWaitCycles }
+    is(6.U) { debugCounterValue := perfOutputQFullStallCycles }
+    is(7.U) { debugCounterValue := perfMemBusyCycles }
+    is(8.U) { debugCounterValue := tilesIssuedCnt }
+    is(9.U) { debugCounterValue := tilesLoadedCnt }
+    is(10.U) { debugCounterValue := tilesComputedCnt }
+    is(11.U) { debugCounterValue := tilesStoredCnt }
+  }
 
   val validKernelSize =
     (rs1Reg === 1.U) || (rs1Reg === 3.U) || (rs1Reg === 5.U)
@@ -435,6 +466,15 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     memInflight := false.B
     memKindReg := memNone
     memPreferStore := false.B
+
+    perfTotalCycles := 0.U
+    perfLoadReqs := 0.U
+    perfStoreReqs := 0.U
+    perfReuseTiles := 0.U
+    perfFullLoadTiles := 0.U
+    perfComputeWaitCycles := 0.U
+    perfOutputQFullStallCycles := 0.U
+    perfMemBusyCycles := 0.U
   }
 
   switch(state) {
@@ -501,6 +541,10 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
           resultReg := RET_ERROR
           state := sRespond
         }
+
+      }.elsewhen(doDebug) {
+        resultReg := debugCounterValue
+        state := sRespond
 
       }.otherwise {
         resultReg := RET_ERROR
@@ -608,6 +652,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
     }
 
     is(sCompute) {
+      perfTotalCycles := perfTotalCycles + 1.U
+
       val totalTiles = TOTAL_TILES.U(9.W)
       val allTileLoadsStarted = tilesIssuedCnt === totalTiles
 
@@ -642,6 +688,8 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
             // new row 0 gets old row 1, ..., new row K-2 gets old row K-1.
             // Then the load engine only loads the newest bottom row K-1.
             when(canReuseNow) {
+              perfReuseTiles := perfReuseTiles + 1.U
+
               for (r <- 0 until (MAX_KERNEL_SIZE - 1)) {
                 for (c <- 0 until MAX_TILE_WIDTH) {
                   when((r.U < (kernelSizeReg - 1.U)) && (c.U < tileWidth)) {
@@ -651,6 +699,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
               }
               resetTileLoadCursors(kernelSizeReg - 1.U)
             }.otherwise {
+              perfFullLoadTiles := perfFullLoadTiles + 1.U
               resetTileLoadCursors(0.U)
             }
 
@@ -762,6 +811,22 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
       val chooseLoad        = loadNeedsMemory && (!storeNeedsMemory || preferLoadNow)
       val chooseStore       = storeNeedsMemory && !chooseLoad
 
+      val computeAtFinalMacRow =
+        (computeState === computeRun) &&
+        (computeMacRow === (kernelSizeReg - 1.U))
+
+      when(computeStarving && !allTileLoadsStarted) {
+        perfComputeWaitCycles := perfComputeWaitCycles + 1.U
+      }
+
+      when(computeAtFinalMacRow && !outputQ.io.enq.ready) {
+        perfOutputQFullStallCycles := perfOutputQFullStallCycles + 1.U
+      }
+
+      when(memInflight || chooseLoad || chooseStore) {
+        perfMemBusyCycles := perfMemBusyCycles + 1.U
+      }
+
       when(chooseLoad) {
         io.mem.req.valid := true.B
         io.mem.req.bits.addr := tileLoadMemAddr
@@ -772,6 +837,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         io.mem.req.bits.dprv := dprvReg
 
         when(io.mem.req.fire) {
+          perfLoadReqs := perfLoadReqs + 1.U
           memInflight := true.B
           memKindReg := memLoadTile
           memLoadBufIdReg := loadBufIdReg
@@ -794,6 +860,7 @@ class MyConvAccelModule(outer: MyConvAccel)(implicit p: Parameters)
         outputQ.io.deq.ready := io.mem.req.ready
 
         when(io.mem.req.fire) {
+          perfStoreReqs := perfStoreReqs + 1.U
           memInflight := true.B
           memKindReg := memStoreOut
           memPreferStore := false.B
